@@ -482,11 +482,31 @@ function New-OrgRoleMapHtml {
         [Parameter()][string]$WindowLabel = '',
         [Parameter()][string]$OrgTreeBuiltUtc = '',
         [Parameter()][string]$StaleWarning = '',
-        [Parameter()][int]$MaxTableRows = 800
+        [Parameter()][int]$MaxTableRows = 800,
+        [Parameter()][switch]$ManagersOnly,
+        [Parameter()][int]$ManagersOnlyThreshold = 400
     )
 
     $nodes = $Aggregate.Nodes
     $isDelta = ($Mode -eq 'Delta')
+
+    # ---- Scale guard: for large orgs, draw only the management hierarchy + the synthetic buckets
+    # and roll individual contributors (leaf people) up into their manager's counts. The spatial
+    # layout's width grows with the number of LEAVES, so thousands of ICs blow the SVG out
+    # horizontally (illegible, and too wide to rasterise to PNG). Drawing managers-only keeps it
+    # legible; the per-person detail still lives in the table below. Auto-engages past the threshold
+    # (raise -ManagersOnlyThreshold to disable). A "manager" = any node with >=1 report; the
+    # no-manager bucket has reports too, so it stays as a single node showing its count.
+    $autoCollapsed = $false
+    if (-not $ManagersOnly -and $nodes.Count -gt $ManagersOnlyThreshold) { $ManagersOnly = $true; $autoCollapsed = $true }
+    $drawn = New-Object 'System.Collections.Generic.HashSet[string]'
+    if ($ManagersOnly) {
+        foreach ($k in $nodes.Keys) {
+            if (@($nodes[$k].ChildDns | Where-Object { $nodes.ContainsKey($_) }).Count -gt 0) { [void]$drawn.Add($k) }
+        }
+    }
+    $managersShown = $drawn.Count
+    $icRolled = if ($ManagersOnly) { [math]::Max(0, $nodes.Count - $drawn.Count) } else { 0 }
 
     # ---- Render tree: a virtual root over the real roots + the unmanaged bucket --------------
     $ROOT = '__root__'
@@ -497,9 +517,14 @@ function New-OrgRoleMapHtml {
 
     $childrenOf = {
         param($key)
-        if ($key -eq $ROOT) { return @($rootChildren) }
+        if ($key -eq $ROOT) {
+            if ($ManagersOnly) { return @($rootChildren | Where-Object { $drawn.Contains($_) }) }
+            return @($rootChildren)
+        }
         if (-not $nodes.ContainsKey($key)) { return @() }
-        return @($nodes[$key].ChildDns | Where-Object { $nodes.ContainsKey($_) } | Sort-Object `
+        $ch = @($nodes[$key].ChildDns | Where-Object { $nodes.ContainsKey($_) })
+        if ($ManagersOnly) { $ch = @($ch | Where-Object { $drawn.Contains($_) }) }
+        return @($ch | Sort-Object `
             @{ Expression = { $nodes[$_].SubtreePrivRefs }; Descending = $true }, `
             @{ Expression = { $nodes[$_].SubtreeGroupRefs }; Descending = $true }, `
             @{ Expression = { $nodes[$_].Display } })
@@ -575,7 +600,7 @@ function New-OrgRoleMapHtml {
         $band = & $bandOf $key
         $rad = [int](7 + [math]::Min(20, [math]::Sqrt([double]([math]::Max($n.SubtreeGroupRefs, 1))) * 3))
         $lab = & $labelOf $key
-        $countTxt = "$($n.SubtreePrivRefs) priv / $($n.SubtreeGroupRefs) total"
+        $countTxt = if ($ManagersOnly) { "$($n.SubtreeDistinctUsers) ppl / $($n.SubtreePrivRefs) priv" } else { "$($n.SubtreePrivRefs) priv / $($n.SubtreeGroupRefs) total" }
         $deltaTxt = ''
         if ($isDelta -and (($n.DeltaAdded + $n.DeltaRemoved) -gt 0)) { $deltaTxt = "<tspan class='dadd'>+$($n.DeltaAdded)</tspan> <tspan class='drem'>-$($n.DeltaRemoved)</tspan>" }
         $flag = ''
@@ -620,6 +645,23 @@ function New-OrgRoleMapHtml {
     $tableRows = @($pairCount.Keys | Sort-Object { - $pairCount[$_] }, { $_ })
     $rowTrunc = $false
     if ($tableRows.Count -gt $MaxTableRows) { $rowTrunc = $true; $tableRows = $tableRows[0..($MaxTableRows - 1)] }
+    # Disambiguate rows whose displayed path collides -- distinct DNs/GUIDs that render the same
+    # name (duplicate/colliding accounts, or unresolved "(unknown)" managers). Append the account's
+    # SamAccountName (or its OU) so identical-looking rows can be told apart.
+    $nodePath = @{}; $pathSeen = @{}
+    foreach ($pk0 in $tableRows) {
+        $nk0 = ($pk0 -split "`n", 2)[0]
+        if (-not $nodePath.ContainsKey($nk0)) { $ps0 = & $pathOf $nk0; $nodePath[$nk0] = $ps0; $pathSeen[$ps0] = ([int]$pathSeen[$ps0]) + 1 }
+    }
+    $disambOf = {
+        param($nk)
+        $ps = $nodePath[$nk]
+        if ([int]$pathSeen[$ps] -le 1) { return '' }
+        $nd = if ($nodes.ContainsKey($nk)) { $nodes[$nk] } else { $null }
+        if ($nd -and $nd.Sam) { return " ($($nd.Sam))" }
+        if ($nd -and $nd.Dn) { $ou = ([regex]::Match([string]$nd.Dn, '(?i)OU=([^,]+)')).Groups[1].Value; if ($ou) { return " [OU=$ou]" } }
+        return ''
+    }
     $rowSb = New-Object System.Text.StringBuilder
     if (@($tableRows).Count -eq 0) {
         [void]$rowSb.Append('<tr><td colspan="4" class="none">No tracked access could be mapped to the org chart.</td></tr>')
@@ -630,7 +672,7 @@ function New-OrgRoleMapHtml {
             $isPriv = $pairPriv.ContainsKey($pk)
             $badge = if ($isPriv) { '<span class="badge bpriv">Privileged</span>' } else { '<span class="badge btrack">Standard</span>' }
             [void]$rowSb.Append('<tr>')
-            [void]$rowSb.Append('<td class="path">' + (ConvertTo-OrgHtmlText (& $pathOf $nodeKey)) + '</td>')
+            [void]$rowSb.Append('<td class="path">' + (ConvertTo-OrgHtmlText ($nodePath[$nodeKey] + (& $disambOf $nodeKey))) + '</td>')
             [void]$rowSb.Append('<td>' + (ConvertTo-OrgHtmlText $grp) + '</td>')
             [void]$rowSb.Append('<td class="num">' + $pairCount[$pk] + '</td>')
             [void]$rowSb.Append('<td>' + $badge + '</td>')
@@ -661,6 +703,10 @@ function New-OrgRoleMapHtml {
         $modeLine += " &bull; Directory data as of " + (ConvertTo-OrgHtmlText $builtFriendly)
     }
     $staleBanner = if ($StaleWarning) { '<div class="stale" role="alert">&#9888; ' + (ConvertTo-OrgHtmlText $StaleWarning) + '</div>' } else { '' }
+    $collapseHtml = if ($ManagersOnly) {
+        $verb = if ($autoCollapsed) { ("Large org (" + ($icRolled + $managersShown) + " people): showing managers only") } else { 'Managers-only view' }
+        '<p class="maphint" style="margin-top:6px">&#9650; ' + (ConvertTo-OrgHtmlText ("$verb -- $managersShown manager/branch node(s); $icRolled individual contributor(s) rolled into their manager's counts. Full per-person detail is in the table below.")) + '</p>'
+    } else { '' }
     $deltaKpi = if ($isDelta) { ('<div class="card"><div class="k">Access changes placed / unplaced</div><div class="v">{0} / {1}</div><div class="kdef">Changes we could / could not tie to a person on the chart</div></div>' -f $S['DeltaMatched'], $S['DeltaUnmatched']) } else { '' }
 
     # Manager / individual split is shown as one combined card.
@@ -759,6 +805,7 @@ $toggleHtml
     <button type="button" id="om-png">Save as image</button>
     <span class="maphint">Drag to move &bull; scroll to zoom &bull; click a person to show or hide their team. Save as image for slides; the full breakdown is in the table below.</span>
   </div>
+  $collapseHtml
   <div class="mapframe">
     <svg class="orgmap" viewBox="0 0 $svgW $svgH" preserveAspectRatio="xMidYMin meet" role="tree" aria-label="Org role map; full detail in the table below" aria-describedby="om-table">
       <g id="om-pan">
@@ -847,12 +894,23 @@ $toggleHtml
     var url='data:image/svg+xml;base64,'+btoa(unescape(encodeURIComponent(xml)));
     var img=new Image();
     img.onload=function(){
-      var scale=(W*2>16000||H*2>16000)?1:2;
-      var c=document.createElement('canvas'); c.width=Math.ceil(W*scale); c.height=Math.ceil(H*scale);
+      // Cap the ABSOLUTE canvas size, not just the 2x multiplier -- browsers refuse canvases past
+      // ~16k px and toDataURL then returns an empty string (a PNG that won't open). Scale down so the
+      // longest side fits MAX; prefer 2x for crispness when it fits.
+      var MAX=16000;
+      var scale=2;
+      if (W*scale>MAX || H*scale>MAX){ scale=Math.min(MAX/W, MAX/H, 2); }
+      if (!(scale>0)) scale=1;
+      var cw=Math.max(1,Math.floor(W*scale)), ch=Math.max(1,Math.floor(H*scale));
+      var c=document.createElement('canvas'); c.width=cw; c.height=ch;
       var ctx=c.getContext('2d'); ctx.scale(scale,scale);
       ctx.fillStyle=(cs.getPropertyValue('--surface')||'#ffffff').trim(); ctx.fillRect(0,0,W,H);
       ctx.drawImage(img,0,0,W,H);
-      try { var a=document.createElement('a'); a.download='org-role-map.png'; a.href=c.toDataURL('image/png'); a.click(); }
+      try {
+        var durl=c.toDataURL('image/png');
+        if(!durl || durl.length<128){ alert('PNG export failed: the chart is too large to rasterise. Use the managers-only view (large orgs collapse automatically) or scope with -Groups.'); return; }
+        var a=document.createElement('a'); a.download='org-role-map.png'; a.href=durl; a.click();
+      }
       catch(e){ alert('PNG export failed: '+e.message); }
     };
     img.onerror=function(){ alert('PNG export failed to rasterise the chart.'); };

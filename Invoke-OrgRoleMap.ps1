@@ -65,6 +65,7 @@ param(
     [switch]$ReplacePrivilegedBuiltins,
     [ValidateRange(1, 100)][int]$DepthCap = 20,
     [ValidateRange(0, 100)][int]$DefaultOpenDepth = 2,
+    [switch]$ManagersOnly,
     [switch]$BuildOrgTree,
     [string]$Server,
     [switch]$AllowInsecure,
@@ -267,7 +268,7 @@ if ($ExportCsv) {
     } catch { Write-Host "  [warn] -ExportCsv failed: $_" -ForegroundColor Yellow }
 }
 if ($OutputHtml) {
-    try { $null = New-OrgRoleMapHtml -Aggregate $agg -MemberRefs $refs -Mode $Mode -OutputPath $OutputHtml -WindowLabel $windowLabel -OrgTreeBuiltUtc $builtUtc -StaleWarning $staleWarn -DefaultOpenDepth $DefaultOpenDepth; Write-Host ("  HTML report: {0}" -f $OutputHtml) -ForegroundColor Gray }
+    try { $null = New-OrgRoleMapHtml -Aggregate $agg -MemberRefs $refs -Mode $Mode -OutputPath $OutputHtml -WindowLabel $windowLabel -OrgTreeBuiltUtc $builtUtc -StaleWarning $staleWarn -DefaultOpenDepth $DefaultOpenDepth -ManagersOnly:$ManagersOnly; Write-Host ("  HTML report: {0}" -f $OutputHtml) -ForegroundColor Gray }
     catch { Write-Host "  [warn] -OutputHtml failed: $_" -ForegroundColor Yellow }
 }
 
