@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{TITLE}}</title>
+    <style>
+        /* ---- Base ---- */
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f6fa;
+            color: #2c3e50;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+
+        /* ---- Header ---- */
+        header {
+            background: #1B2A4A;
+            padding: 28px 35px;
+            border-radius: 10px;
+            margin-bottom: 28px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.15);
+        }
+        header h1 {
+            font-size: 2em;
+            color: #ffffff;
+            margin-bottom: 6px;
+        }
+        header .meta {
+            font-size: 0.88em;
+            color: #a0aec0;
+        }
+
+        /* ---- KPI Cards Grid ---- */
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 18px;
+            margin-bottom: 28px;
+        }
+        .kpi-card {
+            background: #ffffff;
+            border-radius: 10px;
+            padding: 24px;
+            text-align: center;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            border-top: 4px solid #2CA58D;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .kpi-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+        }
+        .kpi-card.accent-danger { border-top-color: #E74C3C; }
+        .kpi-card.accent-warning { border-top-color: #F39C12; }
+        .kpi-card.accent-primary { border-top-color: #1B2A4A; }
+        .kpi-value {
+            font-size: 2.4em;
+            font-weight: 700;
+            line-height: 1.1;
+            color: #1B2A4A;
+        }
+        .kpi-label {
+            font-size: 0.82em;
+            color: #8B8680;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-top: 6px;
+        }
+        .kpi-trend {
+            font-size: 0.78em;
+            margin-top: 4px;
+        }
+        .kpi-trend.up { color: #2CA58D; }
+        .kpi-trend.down { color: #E74C3C; }
+        .kpi-trend.neutral { color: #8B8680; }
+
+        /* ---- Section panels ---- */
+        .panel {
+            background: #ffffff;
+            border-radius: 10px;
+            margin-bottom: 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            overflow: hidden;
+        }
+        .panel-header {
+            padding: 18px 25px;
+            border-bottom: 2px solid #2CA58D;
+        }
+        .panel-header h2 {
+            color: #1B2A4A;
+            font-size: 1.3em;
+        }
+        .panel-body { padding: 25px; }
+
+        /* ---- Charts grid ---- */
+        .chart-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 24px;
+            margin-bottom: 24px;
+        }
+        .chart-container {
+            background: #ffffff;
+            border-radius: 10px;
+            padding: 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            text-align: center;
+        }
+        .chart-container h3 {
+            color: #1B2A4A;
+            font-size: 1em;
+            margin-bottom: 16px;
+        }
+
+        /* ---- Tables ---- */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.92em;
+        }
+        thead th {
+            background: #1B2A4A;
+            color: #ffffff;
+            padding: 11px 14px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 0.82em;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        tbody tr { border-bottom: 1px solid #dcdde1; }
+        tbody tr:last-child { border-bottom: none; }
+        tbody tr:nth-child(even) { background: #f8f9fc; }
+        tbody td { padding: 10px 14px; vertical-align: middle; }
+        td.text-right { text-align: right; }
+
+        /* ---- Status badges ---- */
+        .badge {
+            display: inline-block;
+            padding: 2px 9px;
+            border-radius: 99px;
+            font-size: 0.78em;
+            font-weight: 600;
+            letter-spacing: 0.3px;
+            color: #ffffff;
+        }
+
+        /* ---- Progress bar ---- */
+        .progress-bar-container {
+            background: #dcdde1;
+            border-radius: 10px;
+            overflow: hidden;
+            height: 20px;
+        }
+        .progress-bar-fill {
+            height: 20px;
+            border-radius: 10px;
+            text-align: center;
+            line-height: 20px;
+            font-size: 0.75em;
+            font-weight: 600;
+            color: #ffffff;
+            transition: width 0.6s ease;
+        }
+
+        /* ---- Change velocity bar ---- */
+        .velocity-bar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 8px 0;
+        }
+        .velocity-bar .bar-label {
+            font-size: 0.82em;
+            min-width: 80px;
+            text-align: right;
+            color: #8B8680;
+        }
+        .velocity-bar .bar-track {
+            flex: 1;
+            background: #dcdde1;
+            border-radius: 6px;
+            height: 24px;
+            overflow: hidden;
+        }
+        .velocity-bar .bar-fill {
+            height: 24px;
+            border-radius: 6px;
+            line-height: 24px;
+            text-align: center;
+            font-size: 0.78em;
+            font-weight: 600;
+            color: #ffffff;
+            transition: width 0.6s ease;
+        }
+
+        /* ---- Footer ---- */
+        footer {
+            text-align: center;
+            padding: 28px 0;
+            color: #8B8680;
+            font-size: 0.85em;
+            border-top: 1px solid #dcdde1;
+            margin-top: 24px;
+        }
+
+        /* ---- Print ---- */
+        @media print {
+            body { padding: 0; background: #ffffff; }
+            .kpi-card, .panel, .chart-container { box-shadow: none; border: 1px solid #dcdde1; }
+        }
+
+        /* ---- Responsive ---- */
+        @media screen and (max-width: 768px) {
+            body { padding: 10px; }
+            header h1 { font-size: 1.5em; }
+            .kpi-grid { grid-template-columns: 1fr 1fr; }
+            .chart-grid { grid-template-columns: 1fr; }
+        }
+        @media screen and (max-width: 480px) {
+            .kpi-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <!-- ===== HEADER ===== -->
+    <header>
+        <h1>{{TITLE}}</h1>
+        <div class="meta">Generated: {{TIMESTAMP}} &nbsp;|&nbsp; Version: {{TOOL_VERSION}}</div>
+    </header>
+
+    <!-- ===== KPI CARDS ===== -->
+    <div class="kpi-grid">
+        {{KPI_CARDS}}
+    </div>
+
+    <!-- ===== CHARTS ===== -->
+    <div class="chart-grid">
+        {{CHARTS}}
+    </div>
+
+    <!-- ===== DOMAIN STATUS ===== -->
+    <div class="panel">
+        <div class="panel-header">
+            <h2>Per-Domain Summary</h2>
+        </div>
+        <div class="panel-body">
+            {{DOMAIN_STATUS}}
+        </div>
+    </div>
+
+    <!-- ===== CHANGE VELOCITY (conditional) ===== -->
+    <div class="panel" style="display:{{CHANGE_VELOCITY_DISPLAY}};">
+        <div class="panel-header">
+            <h2>Change Velocity</h2>
+        </div>
+        <div class="panel-body">
+            {{CHANGE_VELOCITY}}
+        </div>
+    </div>
+
+    <!-- ===== FOOTER ===== -->
+    <footer>
+        {{FOOTER}}
+    </footer>
+
+</div>
+
+<script>
+(function () {
+    'use strict';
+    /* Animate progress bars on load */
+    document.querySelectorAll('.progress-bar-fill, .bar-fill').forEach(function (bar) {
+        var target = bar.getAttribute('data-percent') || '0';
+        var w = bar.style.width;
+        bar.style.width = '0%';
+        setTimeout(function () { bar.style.width = target + '%'; }, 100);
+    });
+})();
+</script>
+</body>
+</html>

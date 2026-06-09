@@ -1,0 +1,7 @@
+﻿Cache/
+Logs/
+State/
+Output/
+*.jsonl
+Thumbs.db
+*.zip

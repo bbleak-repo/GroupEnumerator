@@ -1,0 +1,66 @@
+﻿{
+    "LdapPageSize": 1000,
+    "LdapTimeout": 120,
+    "MaxMemberCount": 5000,
+    "SkipLargeGroups": true,
+    "LargeGroupThreshold": 5000,
+    "SkipGroups": ["Domain Users", "Domain Computers", "Authenticated Users"],
+    "FuzzyPrefixes": ["GG_", "USV_", "SG_", "DL_", "GL_"],
+    "FuzzyMinScore": 0.7,
+    "OutputDirectory": "Output",
+    "DefaultTheme": "dark",
+    "CachePath": "Cache",
+    "CacheEnabled": true,
+    "AllowInsecure": false,
+    "AllGroupsPrivileged": true,
+    "PrivilegedPatterns": [],
+    "ReplacePrivilegedBuiltins": false,
+    "LogEnabled": true,
+    "LogPath": "Logs",
+    "LogLevel": "INFO",
+    "NestedGroupMaxDepth": 10,
+    "StaleAccountDays": 90,
+    "CorrelationStrategy": "email-first",
+    "AppMappingCsvPath": null,
+    "ChangeTracking": {
+        "Enabled": false,
+        "UnifiedState": true,
+        "StatePath": "State",
+        "StateFile": "membership-state.json",
+        "ChangeLogFile": "changelog.jsonl",
+        "DefaultChangeType": "Both",
+        "MaxChangeLogSizeMB": 50,
+        "RetentionDays": 0
+    },
+    "Enumeration": {
+        "Incremental": false
+    },
+    "StateBackend": "json",
+    "SqliteDbPath": "State/group-enumerator.db",
+    "GarbageCollectDays": 90,
+    "Reporting": {
+        "GovernanceReport": false,
+        "ComplianceReport": false,
+        "ExecutiveDashboard": false,
+        "LeadershipSummary": false,
+        "IdentityDetailThreshold": 3
+    },
+    "Email": {
+        "Enabled": false,
+        "SmtpServer": "",
+        "SmtpPort": 25,
+        "UseSsl": false,
+        "From": "",
+        "To": [],
+        "Cc": [],
+        "SubjectPrefix": "[Migration Readiness]",
+        "AttachReport": true
+    }
+}
+
+
+
+
+
+
+

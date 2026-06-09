@@ -1,0 +1,5 @@
+Domain,GroupName
+CORP,Domain Admins
+,"CN=GG_IT_Admins,OU=Groups,OU=Corp,DC=corp,DC=com"
+,"CN=CyberArk-Vault Admins,OU=PAM,DC=corp,DC=com"
+EUROPE,Helpdesk

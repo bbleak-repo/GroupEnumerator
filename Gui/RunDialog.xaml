@@ -1,0 +1,85 @@
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Confirm Run Parameters"
+    WindowStartupLocation="CenterOwner"
+    SizeToContent="WidthAndHeight"
+    ResizeMode="NoResize"
+    MinWidth="500"
+    Background="{DynamicResource BrushBackground}"
+    Foreground="{DynamicResource BrushText}"
+    FontFamily="Segoe UI"
+    FontSize="13">
+
+    <Window.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="Styles.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
+        </ResourceDictionary>
+    </Window.Resources>
+
+    <Border Padding="20" Background="{DynamicResource BrushBackground}">
+        <StackPanel>
+
+            <!-- Header -->
+            <TextBlock Text="Review your run configuration:"
+                       Foreground="{DynamicResource BrushText}"
+                       FontSize="14" FontWeight="SemiBold"
+                       Margin="0,0,0,16"/>
+
+            <!-- Run Summary -->
+            <Border Background="{DynamicResource BrushSurface}"
+                    CornerRadius="6"
+                    BorderBrush="{DynamicResource BrushBorder}"
+                    BorderThickness="1"
+                    Padding="16,12"
+                    Margin="0,0,0,12">
+                <TextBlock x:Name="TxtRunSummary"
+                           Foreground="{DynamicResource BrushText}"
+                           FontSize="12"
+                           TextWrapping="Wrap"
+                           Text="CSV: (none selected)&#x0a;Options: 0 enabled&#x0a;Reports: 0 selected"/>
+            </Border>
+
+            <!-- Command Preview -->
+            <TextBlock Text="Command:"
+                       Foreground="{DynamicResource BrushTextMuted}"
+                       FontSize="11" Margin="0,0,0,4"/>
+            <Border Background="{DynamicResource BrushSurfaceAlt}"
+                    CornerRadius="4"
+                    BorderBrush="{DynamicResource BrushBorder}"
+                    BorderThickness="1"
+                    Padding="12,8"
+                    Margin="0,0,0,20">
+                <TextBlock x:Name="TxtCommandSummary"
+                           FontFamily="Consolas" FontSize="11"
+                           Foreground="{DynamicResource BrushText}"
+                           TextWrapping="Wrap"
+                           Text=".\Invoke-GroupEnumerator.ps1 -CsvPath ..."/>
+            </Border>
+
+            <!-- Buttons -->
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <Button Grid.Column="1" x:Name="BtnRunConfirm"
+                        Content="Run"
+                        Style="{StaticResource ToolkitButton}"
+                        IsDefault="True"
+                        Padding="24,8" FontSize="13"/>
+                <Button Grid.Column="3" x:Name="BtnRunCancel"
+                        Content="Cancel"
+                        Style="{StaticResource SecondaryButton}"
+                        IsCancel="True"
+                        Padding="24,8" FontSize="13"/>
+            </Grid>
+
+        </StackPanel>
+    </Border>
+</Window>

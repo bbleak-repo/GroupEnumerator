@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{TITLE}}</title>
+</head>
+<body style="font-family:Arial,Helvetica,sans-serif; margin:0; padding:24px; background:#f0f2f5; color:#333333;">
+
+<!-- Outer container table for Word compatibility -->
+<table cellpadding="0" cellspacing="0" border="0" style="max-width:1100px; margin:0 auto; background:#ffffff; padding:0;">
+<tr><td style="padding:32px 40px;">
+
+    <!-- ===== HEADER ===== -->
+    <table cellpadding="0" cellspacing="0" border="0" style="width:100%; margin-bottom:24px;">
+    <tr>
+        <td style="background:#34495e; padding:24px 30px;">
+            <h1 style="font-family:Arial,Helvetica,sans-serif; color:#ffffff; font-size:22px; margin:0 0 6px 0;">{{TITLE}}</h1>
+            <p style="font-family:Arial,Helvetica,sans-serif; color:#cccccc; font-size:12px; margin:0;">{{SUBTITLE}}</p>
+            <p style="font-family:Arial,Helvetica,sans-serif; color:#cccccc; font-size:11px; margin:4px 0 0 0;">Generated: {{TIMESTAMP}} &nbsp;|&nbsp; Version: {{TOOL_VERSION}}</p>
+        </td>
+    </tr>
+    </table>
+
+    <!-- ===== EXECUTIVE SUMMARY ===== -->
+    <h2 style="font-family:Arial,Helvetica,sans-serif; color:#2c3e50; border-bottom:2px solid #336699; padding-bottom:6px; margin-top:24px; margin-bottom:12px; font-size:16px;">Executive Summary</h2>
+    {{EXECUTIVE_SUMMARY}}
+
+    <hr style="border:none; border-top:1px solid #e0e0e0; margin:24px 0;" />
+
+    <!-- ===== GROUP MEMBERSHIP SNAPSHOT (Audit Evidence) ===== -->
+    <h2 style="font-family:Arial,Helvetica,sans-serif; color:#2c3e50; border-bottom:2px solid #336699; padding-bottom:6px; margin-top:24px; margin-bottom:12px; font-size:16px;">Group Membership Snapshot (Audit Evidence)</h2>
+    {{GROUP_SNAPSHOT}}
+
+    <hr style="border:none; border-top:1px solid #e0e0e0; margin:24px 0;" />
+
+    <!-- ===== CHANGE LOG SUMMARY (conditional) ===== -->
+    <div style="display:{{CHANGE_LOG_DISPLAY}};">
+        <h2 style="font-family:Arial,Helvetica,sans-serif; color:#2c3e50; border-bottom:2px solid #336699; padding-bottom:6px; margin-top:24px; margin-bottom:12px; font-size:16px;">Change Log Summary</h2>
+        {{CHANGE_LOG}}
+        <hr style="border:none; border-top:1px solid #e0e0e0; margin:24px 0;" />
+    </div>
+
+    <!-- ===== DRIFT ANALYSIS (conditional) ===== -->
+    <div style="display:{{DRIFT_ANALYSIS_DISPLAY}};">
+        <h2 style="font-family:Arial,Helvetica,sans-serif; color:#2c3e50; border-bottom:2px solid #336699; padding-bottom:6px; margin-top:24px; margin-bottom:12px; font-size:16px;">Drift Analysis</h2>
+        {{DRIFT_ANALYSIS}}
+        <hr style="border:none; border-top:1px solid #e0e0e0; margin:24px 0;" />
+    </div>
+
+    <!-- ===== REMEDIATION STATUS (conditional) ===== -->
+    <div style="display:{{REMEDIATION_DISPLAY}};">
+        <h2 style="font-family:Arial,Helvetica,sans-serif; color:#2c3e50; border-bottom:2px solid #CC3333; padding-bottom:6px; margin-top:24px; margin-bottom:12px; font-size:16px;">Remediation Status</h2>
+        {{REMEDIATION_STATUS}}
+        <hr style="border:none; border-top:1px solid #e0e0e0; margin:24px 0;" />
+    </div>
+
+    <!-- ===== REVIEWER SIGN-OFF ===== -->
+    <h2 style="font-family:Arial,Helvetica,sans-serif; color:#2c3e50; border-bottom:2px solid #336699; padding-bottom:6px; margin-top:24px; margin-bottom:12px; font-size:16px;">Reviewer Sign-Off</h2>
+    {{REVIEWER_SIGNOFF}}
+
+    <!-- ===== FOOTER ===== -->
+    <table cellpadding="0" cellspacing="0" border="0" style="width:100%; margin-top:32px; border-top:1px solid #dee2e6;">
+    <tr>
+        <td style="padding:12px 0; text-align:center; color:#777777; font-family:Arial,Helvetica,sans-serif; font-size:11px;">
+            {{FOOTER}}
+        </td>
+    </tr>
+    </table>
+
+</td></tr>
+</table>
+
+</body>
+</html>
