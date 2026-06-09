@@ -1047,6 +1047,7 @@ function Start-GuiEnumeration {
         OutputFiles   = @()
     })
     $script:SyncHash = $syncHash
+    $script:LastRunStatus = $null   # reset live status-bar tracker for this run
 
     # ---------------------------------------------------------------------------
     # Create and launch the background runspace
@@ -1107,10 +1108,27 @@ function Start-GuiEnumeration {
                 throw "Invoke-GroupEnumerator.ps1 not found at: $mainScript"
             }
 
-            # Run the script using dot-sourcing with splatted parameters
-            . $mainScript @params
+            # Run the script, capturing its live Write-Host stream (6>&1 = the Information stream)
+            # so the GUI shows real-time progress instead of a bar frozen at 5%. Each line is pushed
+            # to Messages (drained into the log + status bar by the poll timer) and parsed for the
+            # [i/N] per-group enumeration counter and the report-generation phase. Only stream 6 is
+            # redirected, so errors/warnings still flow to their own streams (HadErrors detection).
+            . $mainScript @params 6>&1 | ForEach-Object {
+                $line = [string]$_
+                if ([string]::IsNullOrWhiteSpace($line)) { return }
+                $syncHash.Messages.Add($line)
+                $syncHash.StatusMessage = $line.Trim()
+                $mm = [regex]::Match($line, '\[(\d+)\s*/\s*(\d+)\]')
+                if ($mm.Success -and [int]$mm.Groups[2].Value -gt 0) {
+                    $syncHash.Progress = [int](5 + ([int]$mm.Groups[1].Value / [double][int]$mm.Groups[2].Value) * 80)
+                }
+                elseif ($line -match 'Generating|Composing|Baseline|Governance|Compliance|Executive|Leadership|Writing|report') {
+                    if ($syncHash.Progress -lt 90) { $syncHash.Progress = 90 }
+                }
+            }
 
             $syncHash.Progress = 100
+            $syncHash.StatusMessage = 'Finalizing...'
             $syncHash.Messages.Add('Enumeration completed successfully.')
 
             # Collect output files from the output directory
@@ -1206,6 +1224,14 @@ function Start-GuiEnumeration {
                 $msg = $capturedSync.Messages[$capturedSync.MessageIndex]
                 $capturedSync.MessageIndex++
                 Append-LogMessage $msg
+            }
+
+            # Surface the latest activity line on the bottom status bar (live, not a static message).
+            if (-not ($done -or $timeout) -and $capturedSync.StatusMessage -and $capturedSync.StatusMessage -ne $script:LastRunStatus) {
+                $script:LastRunStatus = $capturedSync.StatusMessage
+                $sb = $capturedSync.StatusMessage
+                if ($sb.Length -gt 90) { $sb = $sb.Substring(0, 90) + '...' }
+                Set-StatusMessage -Message ("$($capturedSync.Progress)%  $sb")
             }
 
             # Update progress bar and elapsed time
