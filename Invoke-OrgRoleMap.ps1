@@ -66,6 +66,8 @@ param(
     [ValidateRange(1, 100)][int]$DepthCap = 20,
     [ValidateRange(0, 100)][int]$DefaultOpenDepth = 2,
     [switch]$ManagersOnly,
+    [string[]]$ServiceAccountOU,
+    [string[]]$ServiceAccountPattern,
     [switch]$BuildOrgTree,
     [string]$Server,
     [switch]$AllowInsecure,
@@ -114,6 +116,14 @@ $replPriv = $ReplacePrivilegedBuiltins.IsPresent -or ($cfgPriv -and $cfgPriv.Rep
 $pred = New-RCPrivilegedPredicate -ExtraPatterns $privPats -All:$allPriv -ReplaceBuiltins:$replPriv
 if ($allPriv) { Write-Host '  (privileged scope: ALL tracked groups)' -ForegroundColor DarkGray }
 elseif ($privPats.Count -gt 0) { Write-Host ("  (privileged scope: built-ins{0} + custom [{1}])" -f $(if ($replPriv) { ' OFF' } else { '' }), ($privPats -join ', ')) -ForegroundColor DarkGray }
+
+# Service-account classification: params override config (ServiceAccountOUs, ServiceAccountPatterns).
+# A no-manager service account then reads as EXPECTED instead of a data-quality gap.
+$svcOUs  = if ($ServiceAccountOU) { $ServiceAccountOU } elseif ($cfgPriv -and $cfgPriv.ServiceAccountOUs) { @($cfgPriv.ServiceAccountOUs) } else { @() }
+$svcPats = if ($ServiceAccountPattern) { $ServiceAccountPattern } elseif ($cfgPriv -and $cfgPriv.ServiceAccountPatterns) { @($cfgPriv.ServiceAccountPatterns) } else { @() }
+$svcPred = if ($svcOUs.Count -gt 0 -or $svcPats.Count -gt 0) { New-OrgServiceAccountPredicate -OrgUnits $svcOUs -NamePatterns $svcPats } else { $null }
+if ($svcPred) { Write-Host ("  (service accounts: OU [{0}]{1})" -f ($svcOUs -join ', '), $(if ($svcPats.Count) { ' + pattern [' + ($svcPats -join ', ') + ']' } else { '' })) -ForegroundColor DarkGray }
+
 $orgTreeFile = Resolve-LocalPath $OrgTreePath (Join-Path $scriptRoot (Join-Path 'State' 'org-tree.json'))
 
 Write-Host ''
@@ -204,7 +214,7 @@ if ($Mode -eq 'Full') {
     }
 }
 
-$tree = Build-OrgTree -OrgTreeCache $orgTreeCache
+$tree = if ($svcPred) { Build-OrgTree -OrgTreeCache $orgTreeCache -ServiceAccountPredicate $svcPred } else { Build-OrgTree -OrgTreeCache $orgTreeCache }
 $agg  = Get-OrgRoleAggregate -OrgTree $tree -MemberRefs $refs
 
 # ---- Delta overlay ----

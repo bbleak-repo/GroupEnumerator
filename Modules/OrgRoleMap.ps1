@@ -69,9 +69,19 @@ function Get-OrgNodeEntries {
 
 function Get-OrgDnKey {
     # Stable join key: lowercased DN. DN is globally unique across domains; Sam is not.
+    # Escaping-insensitive: a value/manager DN escaped as hex (\2C) and the same DN escaped as a
+    # character (\,) must produce the SAME key, or a person whose `manager` attribute and
+    # `distinguishedName` differ only in escape style (common with comma-in-name accounts like
+    # "CN=Last\, First,OU=People") would fail to link to their manager and become a phantom
+    # (unknown) root. Normalize hex escapes (\XX) to the character-escape form so \2C == \, etc.
+    # This only changes escape STYLE (no unescaping), so it cannot collide distinct DNs.
     param([string]$Dn)
     if ([string]::IsNullOrWhiteSpace($Dn)) { return '' }
-    return $Dn.Trim().ToLowerInvariant()
+    $s = $Dn.Trim()
+    if ($s.IndexOf('\') -ge 0) {
+        $s = [regex]::Replace($s, '\\([0-9A-Fa-f]{2})', { param($m) '\' + [char][Convert]::ToInt32($m.Groups[1].Value, 16) })
+    }
+    return $s.ToLowerInvariant()
 }
 
 # -----------------------------------------------------------------------------
@@ -164,6 +174,30 @@ function ConvertTo-OrgTreeCacheFromRecords {
 }
 
 # -----------------------------------------------------------------------------
+# PURE: service-account predicate { param($Dn,$Sam,$Display) -> [bool] }
+# -----------------------------------------------------------------------------
+function New-OrgServiceAccountPredicate {
+    <#
+    .SYNOPSIS  Build a predicate that flags service accounts so a no-manager service account reads
+               as EXPECTED rather than a data-quality gap. Matches by containing OU and/or by a
+               SamAccountName/displayName regex.
+    .PARAMETER OrgUnits      OU names whose members are service accounts, e.g. 'ServiceAccounts','Svc Accounts'.
+    .PARAMETER NamePatterns  Regex fragments matched against sAMAccountName and displayName, e.g. 'svc[-_]','\bsa-'.
+    .OUTPUTS [scriptblock]
+    #>
+    [OutputType([scriptblock])]
+    param([string[]]$OrgUnits = @(), [string[]]$NamePatterns = @())
+    $ous  = @($OrgUnits     | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { [regex]::Escape($_.Trim()) })
+    $pats = @($NamePatterns | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    return {
+        param($Dn, $Sam, $Display)
+        if ($Dn) { foreach ($ou in $ous) { if ($Dn -imatch ('(?i)(?:^|,)OU=' + $ou + '(?:,|$)')) { return $true } } }
+        foreach ($p in $pats) { try { if (($Sam -and ($Sam -imatch $p)) -or ($Display -and ($Display -imatch $p))) { return $true } } catch { } }
+        return $false
+    }.GetNewClosure()
+}
+
+# -----------------------------------------------------------------------------
 # PURE: assemble the in-memory org tree from the flat org-tree cache
 # -----------------------------------------------------------------------------
 function Build-OrgTree {
@@ -176,7 +210,10 @@ function Build-OrgTree {
               No-manager nodes WITH reports become roots; no-manager leaves and cyclic/unreachable
               nodes attach to the synthetic __unmanaged__ bucket. Counts-safe (no member data here).
     #>
-    param([Parameter(Mandatory = $true)][object]$OrgTreeCache)
+    param(
+        [Parameter(Mandatory = $true)][object]$OrgTreeCache,
+        [Parameter()][scriptblock]$ServiceAccountPredicate = $null
+    )
 
     $issues  = New-Object System.Collections.Generic.List[string]
     $byDn    = @{}
@@ -186,12 +223,18 @@ function Build-OrgTree {
         $dn  = [string](Get-OrgProp $n 'Dn')
         $key = if ([string]::IsNullOrWhiteSpace($e.Key)) { Get-OrgDnKey $dn } else { $e.Key.ToLowerInvariant() }
         if ([string]::IsNullOrWhiteSpace($key)) { continue }
-        $mdn = [string](Get-OrgProp $n 'ManagerDn')
+        $mdn  = [string](Get-OrgProp $n 'ManagerDn')
+        $sam  = [string](Get-OrgProp $n 'Sam')
+        $disp = [string](Get-OrgProp $n 'Display')
+        # Classify service accounts (OU / name pattern) so a no-manager service account is read as
+        # EXPECTED, not a data-quality gap. Tag is computed here and rolled up in the aggregate.
+        $isSvc = $false
+        if ($ServiceAccountPredicate) { try { $isSvc = [bool](& $ServiceAccountPredicate $dn $sam $disp) } catch { $isSvc = $false } }
         $byDn[$key] = @{
             Dn            = $dn
             DnKey         = $key
-            Sam           = [string](Get-OrgProp $n 'Sam')
-            Display       = [string](Get-OrgProp $n 'Display')
+            Sam           = $sam
+            Display       = $disp
             Domain        = [string](Get-OrgProp $n 'Domain')
             Enabled       = $(if ($null -eq (Get-OrgProp $n 'Enabled')) { $true } else { [bool](Get-OrgProp $n 'Enabled') })
             ManagerDn     = $mdn
@@ -200,6 +243,7 @@ function Build-OrgTree {
             ChildDns      = (New-Object System.Collections.Generic.List[string])
             Depth         = -1
             IsUnmanaged   = $false
+            IsServiceAccount = $isSvc
         }
     }
 
@@ -311,6 +355,7 @@ function Get-OrgRoleAggregate {
         $agg[$key] = @{
             DnKey = $key; Dn = $src.Dn; Sam = $src.Sam; Display = $src.Display; Domain = $src.Domain
             Enabled = $src.Enabled; Resolved = $src.Resolved; IsUnmanaged = $src.IsUnmanaged
+            IsServiceAccount = $(if ($null -eq $src.IsServiceAccount) { $false } else { [bool]$src.IsServiceAccount })
             ChildDns = @($src.ChildDns); Depth = $src.Depth
             DirectGroupRefs = $directRefs.Count; DirectDistinctGroups = $directGrps; DirectPriv = $directPriv
             SubtreeGroupRefs = 0; SubtreePrivRefs = 0; SubtreeDistinctUsers = 0
@@ -375,6 +420,18 @@ function Get-OrgRoleAggregate {
         Select-Object -First 10 |
         ForEach-Object { @{ Display = $_.Display; Sam = $_.Sam; Domain = $_.Domain; SubtreePrivRefs = $_.SubtreePrivRefs; SubtreeGroupRefs = $_.SubtreeGroupRefs } })
 
+    # Split the no-manager bucket into EXPECTED service accounts vs PEOPLE that need review, so a
+    # legitimate service account (OU=ServiceAccounts / name pattern) doesn't inflate the data-quality
+    # finding. Bucket children are the no-manager accounts (usually leaves; cyclic fragments use
+    # their subtree counts).
+    $svcUsers = 0; $svcPriv = 0; $pplUsers = 0; $pplPriv = 0
+    foreach ($ck in $unmanaged.ChildDns) {
+        if (-not $agg.ContainsKey($ck)) { continue }
+        $cn = $agg[$ck]
+        if ($cn.IsServiceAccount) { $svcUsers += $cn.SubtreeDistinctUsers; $svcPriv += $cn.SubtreePrivRefs }
+        else { $pplUsers += $cn.SubtreeDistinctUsers; $pplPriv += $cn.SubtreePrivRefs }
+    }
+
     $summary = @{
         NodeCount            = $nodeCount   # exclude synthetic bucket
         RootCount            = @($OrgTree.RootDns).Count
@@ -388,6 +445,10 @@ function Get-OrgRoleAggregate {
         UnmanagedRefs        = $unmanaged.SubtreeGroupRefs
         UnmanagedPrivRefs    = $unmanaged.SubtreePrivRefs
         UnmanagedDistinctUsers = $unmanaged.SubtreeDistinctUsers
+        ServiceAccountDistinctUsers  = $svcUsers
+        ServiceAccountPrivRefs       = $svcPriv
+        UnmanagedPeopleDistinctUsers = $pplUsers
+        UnmanagedPeoplePrivRefs      = $pplPriv
         TopConcentratedNodes = $topNodes
         Issues               = @($OrgTree.Issues)
     }
@@ -714,6 +775,10 @@ function New-OrgRoleMapHtml {
     $icCount  = if ($null -ne $S['IndividualContributorCount']) { $S['IndividualContributorCount'] } else { 0 }
     $distAccess = if ($null -ne $S['DistinctPeopleWithAccess']) { $S['DistinctPeopleWithAccess'] } else { 0 }
     $distPriv   = if ($null -ne $S['DistinctPeopleWithPriv']) { $S['DistinctPeopleWithPriv'] } else { 0 }
+    # Service accounts (no manager = expected) split out from people-with-no-manager (review).
+    $svcUsers     = if ($null -ne $S['ServiceAccountDistinctUsers']) { $S['ServiceAccountDistinctUsers'] } else { 0 }
+    $pplNoMgrPriv = if ($null -ne $S['UnmanagedPeoplePrivRefs']) { $S['UnmanagedPeoplePrivRefs'] } else { $S.UnmanagedPrivRefs }
+    $svcCardHtml  = if ($svcUsers -gt 0) { '<div class="card"><div class="k">Service accounts (no manager)</div><div class="v">' + $svcUsers + '</div><div class="kdef">Accounts with no manager that are expected to have none (service/automation)</div></div>' } else { '' }
 
     $html = @"
 <!DOCTYPE html>
@@ -792,7 +857,8 @@ $toggleHtml
     <div class="card crit"><div class="k">People with privileged access</div><div class="v">$distPriv</div><div class="kdef">Individuals holding at least one privileged role</div></div>
     <div class="card"><div class="k">Managers vs individuals</div><div class="v">$mgrCount &middot; $icCount</div><div class="kdef">$mgrCount manage others &bull; $icCount individual contributors</div></div>
     <div class="card"><div class="k">Privileged access assignments</div><div class="v">$($S.TotalPrivRefs)</div><div class="kdef">Total privileged roles held (one person can hold several)</div></div>
-    <div class="card$(if ($S.UnmanagedPrivRefs -gt 0) { ' crit' } else { '' })"><div class="k">Privileged access with no manager</div><div class="v">$($S.UnmanagedPrivRefs)</div><div class="kdef">$(if ($S.UnmanagedPrivRefs -gt 0) { 'On accounts with no manager listed (service or orphaned) &mdash; review these' } else { 'None &mdash; good' })</div></div>
+    <div class="card$(if ($pplNoMgrPriv -gt 0) { ' crit' } else { '' })"><div class="k">Privileged access, no manager (review)</div><div class="v">$pplNoMgrPriv</div><div class="kdef">$(if ($pplNoMgrPriv -gt 0) { 'On people whose manager is blank &mdash; a directory gap to review (service accounts counted separately)' } else { 'None &mdash; good' })</div></div>
+    $svcCardHtml
     $deltaKpi
   </section>
 
