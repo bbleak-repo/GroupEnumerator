@@ -153,45 +153,37 @@ $staleWarn = ''
 $staleTripped = $false
 
 if ($Mode -eq 'Full') {
-    # When asked to deep-walk without an explicit -Server, derive the DC target from the snapshot's
-    # domain (DC-locator / serverless bind), mirroring how enumeration resolves it from the CSV. Lets
-    # the GUI request a deep walk without needing a separate LDAP-server field.
-    if ($BuildOrgTree -and -not $Server) {
-        $domGuess = @($refs | ForEach-Object { $_.Domain } | Where-Object { $_ } | Select-Object -First 1)
-        if (-not $domGuess) { foreach ($g in $groupResults) { $dd = Get-OrgProp (Get-OrgProp $g 'Data') 'Domain'; if ($dd) { $domGuess = [string]$dd; break } } }
-        if ($domGuess) { $Server = [string]$domGuess; Write-Host "  (deep-walk DC derived from snapshot domain: $Server)" -ForegroundColor DarkGray }
-    }
-    if ($BuildOrgTree -and $Server) {
-        # Live deep walk: resolve each member's manager chain UP to the top via LDAP. Memoised
-        # per DN (each user + each manager looked up once), so it scales with DISTINCT identities,
-        # not total member-refs. Single-domain lab/forest: one connection serves every base lookup.
+    if ($BuildOrgTree) {
+        # Live deep walk: resolve each member's manager chain UP to the top via LDAP, over a
+        # connection POOL so a multi-domain FOREST resolves cross-domain managers (each domain's DC
+        # auto-located by FQDN on demand). An explicit -Server pins the snapshot's primary domain to
+        # that DC (lab / disconnected DNS / a chosen DC); other domains still auto-locate. Memoised
+        # per DN, so it scales with DISTINCT identities, not total member-refs.
+        $serverGiven = $PSBoundParameters.ContainsKey('Server') -and -not [string]::IsNullOrWhiteSpace($Server)
         try {
-            Write-Host ("Deep manager-chain walk against {0} (AllowInsecure={1}) ..." -f $Server, [bool]$AllowInsecure) -ForegroundColor Gray
-            $conn = New-AdLdapConnection -Server $Server -AllowInsecure:$AllowInsecure
-            Write-Host ("  Connected: tier {0}, port {1}" -f $conn.Tier, $conn.Port) -ForegroundColor DarkGray
-            # Reference the connection via a script-scoped var (NOT GetNewClosure, which would try to
-            # snapshot the [ValidateSet] param vars like $Period and throw).
-            $script:OrgLiveConn = $conn
-            $lookup = {
-                param($Dn)
-                try { $res = Invoke-AdLdapSearch -Context $script:OrgLiveConn -BaseDN $Dn -Scope Base -Filter '(objectClass=*)' -Attributes @('manager', 'sAMAccountName', 'displayName', 'userAccountControl') }
-                catch { return $null }
-                if (-not $res -or @($res).Count -eq 0) { return $null }
-                $e = @($res)[0]
-                $uac = 0; [void][int]::TryParse([string]$e['userAccountControl'], [ref]$uac)
-                return @{ Dn = [string]$e['DistinguishedName']; Sam = [string]$e['sAMAccountName']; Display = [string]$e['displayName']; Domain = (Get-OrgDomainFromDn $Dn); Enabled = (-not ($uac -band 2)); ManagerDn = [string]$e['manager']; Resolved = $true }
-            }
             $memberDns = @($refs | ForEach-Object { $_.Dn } | Where-Object { $_ } | Sort-Object -Unique)
-            Write-Host ("  Walking chains for {0} distinct member DN(s) ..." -f $memberDns.Count) -ForegroundColor DarkGray
+            $domains   = @($refs | ForEach-Object { Get-OrgDomainFromDn $_.Dn } | Where-Object { $_ } | Sort-Object -Unique)
+            $pool = New-AdLdapConnectionPool -AllowInsecure:$AllowInsecure
+            if ($serverGiven) {
+                $primary = @($domains | Select-Object -First 1)
+                Write-Host ("Deep manager-chain walk via {0} (AllowInsecure={1}) ..." -f $Server, [bool]$AllowInsecure) -ForegroundColor Gray
+                $seed = New-AdLdapConnection -Server $Server -AllowInsecure:$AllowInsecure
+                if ($primary) { $pool.Domains[([string]$primary).ToLowerInvariant()] = $seed }
+                Write-Host ("  Connected: tier {0}, port {1}" -f $seed.Tier, $seed.Port) -ForegroundColor DarkGray
+            } else {
+                Write-Host ("Deep manager-chain walk -- auto-locating a DC per domain [{0}] ..." -f ($domains -join ', ')) -ForegroundColor Gray
+            }
+            $lookup = New-OrgAdLookup -Pool $pool
+            Write-Host ("  Walking chains for {0} distinct member DN(s) across {1} domain(s) ..." -f $memberDns.Count, $domains.Count) -ForegroundColor DarkGray
             $orgTreeCache = Build-OrgTreeCache -MemberDns $memberDns -LookupFn $lookup -DepthCap $DepthCap -BuiltByMode 'Full-DeepWalk'
-            try { $conn.Connection.Dispose() } catch {}
-            Write-Host ("  Deep walk complete: {0} org node(s); issues: {1}" -f $orgTreeCache.Nodes.Count, (($orgTreeCache.Metadata.Issues -join ', ') -replace '^$', 'none')) -ForegroundColor Gray
+            $reached = @($pool.Domains.Keys | Where-Object { -not (($pool.Domains[$_] -is [System.Collections.IDictionary]) -and $pool.Domains[$_]['Failed']) }).Count
+            Close-AdLdapConnectionPool $pool
+            Write-Host ("  Deep walk complete: {0} org node(s); {1} domain(s) reached; issues: {2}" -f $orgTreeCache.Nodes.Count, $reached, (($orgTreeCache.Metadata.Issues -join ', ') -replace '^$', 'none')) -ForegroundColor Gray
         } catch {
             Write-Rag 'WARN' "Deep walk failed ($_); falling back to single-hop tree from the snapshot."
             $orgTreeCache = ConvertTo-OrgTreeCacheFromRecords -GroupResults $groupResults
         }
     } else {
-        if ($BuildOrgTree) { Write-Rag 'INFO' '-BuildOrgTree needs -Server <dc> [-AllowInsecure] for the live deep walk; building a single-hop tree from the snapshot manager edges instead.' }
         $orgTreeCache = ConvertTo-OrgTreeCacheFromRecords -GroupResults $groupResults
     }
     try { $null = Save-OrgTreeCache -Cache $orgTreeCache -Path $orgTreeFile; Write-Host ("Org-tree cache written: {0} ({1} node(s))" -f $orgTreeFile, $orgTreeCache.Nodes.Count) -ForegroundColor Gray }

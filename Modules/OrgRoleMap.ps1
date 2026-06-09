@@ -1015,13 +1015,28 @@ function New-OrgAdLookup {
                untrusted domain (the chain stops there - a documented limitation, not a bug).
     #>
     param([Parameter(Mandatory = $true)][hashtable]$Pool, [int]$TimeoutSeconds = 120)
+    # Capture the helper FUNCTIONS as scriptblock variables so GetNewClosure() snapshots them.
+    # GetNewClosure captures variables, NOT functions, so referencing these by name inside the
+    # returned closure fails with "X is not recognized" when it runs from Build-OrgTreeCache's scope
+    # (the original reason this lookup was sidestepped). Capturing + invoking via & makes it portable.
+    $fnCtxForDN  = ${function:Get-AdLdapContextForDN}
+    $fnPooledCtx = ${function:Get-AdLdapPooledContext}
+    $fnDomain    = ${function:Get-OrgDomainFromDn}
+    $fnSearch    = ${function:Invoke-AdLdapSearch}
     return {
         param($Dn)
-        $ctx = Get-AdLdapContextForDN -Pool $Pool -DistinguishedName $Dn
+        $ctx = & $fnCtxForDN -Pool $Pool -DistinguishedName $Dn
+        if ($null -eq $ctx) {
+            # Cross-domain forest: the DN's domain isn't pooled yet -> open it on demand (DC-locator by
+            # FQDN) so a manager who lives in a DIFFERENT forest domain still resolves instead of the
+            # chain dead-ending at the trust boundary. An unreachable/untrusted domain stays $null.
+            $dom = & $fnDomain $Dn
+            if ($dom) { try { $ctx = & $fnPooledCtx -Pool $Pool -Domain $dom } catch { $ctx = $null } }
+        }
         if ($null -eq $ctx) { return $null }
         $res = $null
         try {
-            $res = Invoke-AdLdapSearch -Context $ctx -BaseDN $Dn -Scope Base -Filter '(objectClass=*)' `
+            $res = & $fnSearch -Context $ctx -BaseDN $Dn -Scope Base -Filter '(objectClass=*)' `
                 -Attributes @('manager', 'sAMAccountName', 'displayName', 'userAccountControl') -TimeoutSeconds $TimeoutSeconds
         } catch { return $null }
         if (-not $res -or @($res).Count -eq 0) { return $null }
@@ -1029,7 +1044,7 @@ function New-OrgAdLookup {
         $uac = 0; [void][int]::TryParse([string]$e['userAccountControl'], [ref]$uac)
         return @{
             Dn = [string]$e['DistinguishedName']; Sam = [string]$e['sAMAccountName']; Display = [string]$e['displayName']
-            Domain = (Get-OrgDomainFromDn $Dn); Enabled = (-not ($uac -band 2)); ManagerDn = [string]$e['manager']; Resolved = $true
+            Domain = (& $fnDomain $Dn); Enabled = (-not ($uac -band 2)); ManagerDn = [string]$e['manager']; Resolved = $true
         }
     }.GetNewClosure()
 }
