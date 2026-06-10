@@ -162,13 +162,14 @@ function ConvertTo-OrgTreeCacheFromRecords {
             $en = Get-OrgProp $m 'Enabled'; $en = if ($null -eq $en) { $true } else { [bool]$en }
             $k = Get-OrgDnKey $dn
             # real records win over any stub already created for this DN
-            $nodes[$k] = @{ Dn = $dn; Sam = [string](Get-OrgProp $m 'SamAccountName'); Display = [string](Get-OrgProp $m 'DisplayName'); Domain = $dom; Enabled = $en; ManagerDn = $mgr; Resolved = $true; Synthetic = $false }
+            $mailVal = [string](Get-OrgProp $m 'Mail'); if (-not $mailVal) { $mailVal = [string](Get-OrgProp $m 'Email') }
+            $nodes[$k] = @{ Dn = $dn; Sam = [string](Get-OrgProp $m 'SamAccountName'); Display = [string](Get-OrgProp $m 'DisplayName'); Domain = $dom; Enabled = $en; ManagerDn = $mgr; Resolved = $true; Synthetic = $false; EmployeeId = [string](Get-OrgProp $m 'EmployeeID'); Upn = [string](Get-OrgProp $m 'UserPrincipalName'); Mail = $mailVal; ObjectGuid = [string](Get-OrgProp $m 'ObjectGuid') }
             if ($mgr) { [void]$mgrDns.Add($mgr) }
         }
     }
     foreach ($mdn in $mgrDns) {
         $k = Get-OrgDnKey $mdn
-        if (-not $nodes.ContainsKey($k)) { $nodes[$k] = @{ Dn = $mdn; Sam = ''; Display = ''; Domain = (Get-OrgDomainFromDn $mdn); Enabled = $true; ManagerDn = $null; Resolved = $false; Synthetic = $true } }
+        if (-not $nodes.ContainsKey($k)) { $nodes[$k] = @{ Dn = $mdn; Sam = ''; Display = ''; Domain = (Get-OrgDomainFromDn $mdn); Enabled = $true; ManagerDn = $null; Resolved = $false; Synthetic = $true; EmployeeId = ''; Upn = ''; Mail = ''; ObjectGuid = '' } }
     }
     return @{ Metadata = @{ Version = '1.0'; BuiltUtc = ((Get-Date).ToUniversalTime().ToString('o')); BuiltByMode = 'FromRecords-SingleHop'; DepthCap = 1; NodeCount = $nodes.Count; DomainsResolved = @(); DomainsUnreachable = @(); Issues = @('single-hop-from-cache') }; Nodes = $nodes }
 }
@@ -315,6 +316,673 @@ function Build-OrgTree {
         UnmanagedBucketDn = $script:OrgUnmanagedDn
         Issues            = $issues.ToArray()
     }
+}
+
+# -----------------------------------------------------------------------------
+# PURE: per-account manager-chain health (the 7-state classifier, P1)
+# -----------------------------------------------------------------------------
+function Get-OrgChainHealth {
+    <#
+    .SYNOPSIS  Classify one AD account's manager chain as a routing CONTROL: walk upward from the
+               account toward the DECLARED OrgTop (cycle-guarded, per-hop Enabled) and return the
+               chain state + whether an access review could route to a valid independent approver.
+    .DESCRIPTION
+        PURE: hashtable/PSCustomObject in -> [pscustomobject] out. No AD, no IO, no Get-Date, no
+        closures. The caller (Invoke-OrgRoleMap / Export-AdReconciliationModel) resolves config
+        OrgTopSam / -OrgTop param to a DN, then to a DnKey, and passes it as -OrgTopDnKey; this
+        declared top is the ONLY thing that distinguishes Healthy from OrphanSubRoot (research
+        principle: the org top is declared, not inferred).
+
+        Walk idiom mirrors Resolve-ManagerChain (HashSet visited + DepthCap; advance via the node's
+        ManagerDn DN string -> Get-OrgDnKey to find the parent node). Dual-mode node access via
+        Get-OrgProp so it works on hashtable fixtures (-FromCache) AND ConvertFrom-Json objects.
+        Enabled defaults to $true (mirrors Build-OrgTree). A manager is "not found" when its DnKey is
+        absent from the map OR its node is a Resolved=$false stub (an unresolvable/deleted manager DN).
+
+      ChainState precedence (first match wins):
+        1. Cyclic           - the upward walk revisits a DN (or the start DnKey is empty/unknown loop).
+        2. ManagerNotFound  - a hop's manager DN is set but unresolvable (absent / Resolved=$false stub).
+        3. OrgTop           - the start account IS the declared OrgTop (top of the one sanctioned tree).
+        4. NoManager        - the start account has no manager and is NOT the OrgTop (worst routing).
+        5. terminal reached - the walk ends at a no-manager node:
+             terminal == OrgTop -> ManagerDisabledInChain (some hop disabled) else Healthy
+             terminal != OrgTop -> OrphanSubRoot (skip-level dead-ends below the real top)
+
+      SkipLevelViable is TRUE only when the chain STRICTLY ABOVE the first break is non-empty, every
+      node in it is Enabled, and it tops out at the declared OrgTop -- i.e. escalation past the break
+      still reaches a valid independent approver. For a clean Healthy chain there is no break, so the
+      "above the break" segment is the chain above the account: viable when that segment is non-empty,
+      fully enabled, and reaches OrgTop. OrgTop itself and a bare NoManager have nothing above them.
+
+    .PARAMETER Nodes        DN-keyed node map (hashtable from -FromCache, or PSCustomObject from
+                            ConvertFrom-Json). Each node: Dn, ManagerDn (raw DN string), Enabled,
+                            Resolved. This is the cache's .Nodes collection (NOT Build-OrgTree output).
+    .PARAMETER DnKey        The account's DnKey (already Get-OrgDnKey'd, but re-normalized defensively).
+    .PARAMETER OrgTopDnKey  The declared org top's DN or DnKey (re-normalized via Get-OrgDnKey). Empty
+                            string => no declared top => any clean terminal reads as OrphanSubRoot.
+    .PARAMETER DepthCap     Max hops before bailing (mirrors Resolve-ManagerChain's guard). Default 50.
+    .OUTPUTS  [pscustomobject] { DnKey; ChainState; BreakReason; BreakDepth; SkipLevelViable;
+              ChainToTop (string[], CEO-down); ReachesOrgTop; Depth; HasDisabledHop }.
+              HasDisabledHop is TRUE when ANY node in the walked chain is disabled, INDEPENDENT of the
+              ChainState (which only reports ManagerDisabledInChain when the chain also reaches OrgTop).
+    #>
+    [OutputType([pscustomobject])]
+    param(
+        [object]$Nodes,
+        [string]$DnKey,
+        [string]$OrgTopDnKey = '',
+        [int]$DepthCap = 50
+    )
+
+    $startKey = Get-OrgDnKey $DnKey
+    $topKey   = Get-OrgDnKey $OrgTopDnKey
+
+    # Lookup helper (dual-mode): DnKey -> node object (or $null).
+    $getNode = {
+        param([string]$k)
+        if ([string]::IsNullOrWhiteSpace($k)) { return $null }
+        if ($null -eq $Nodes) { return $null }
+        if ($Nodes -is [System.Collections.IDictionary]) {
+            if ($Nodes.Contains($k)) { return $Nodes[$k] }
+            return $null
+        }
+        $p = $Nodes.PSObject.Properties[$k]
+        if ($null -eq $p) { return $null }
+        return $p.Value
+    }
+    # A node counts as a real, resolved manager when present AND not a Resolved=$false stub.
+    $isResolvedNode = {
+        param($node)
+        if ($null -eq $node) { return $false }
+        $r = Get-OrgProp $node 'Resolved'
+        if ($null -eq $r) { return $true }   # default resolved (mirror Build-OrgTree)
+        return [bool]$r
+    }
+    $nodeEnabled = {
+        param($node)
+        $e = Get-OrgProp $node 'Enabled'
+        if ($null -eq $e) { return $true }   # default enabled (mirror Build-OrgTree line 239)
+        return [bool]$e
+    }
+
+    # Result scaffold.
+    $state         = 'Healthy'
+    $breakReason   = $null
+    $breakDepth    = $null
+    $skipViable    = $false
+    $reachesTop    = $false
+    $startNode     = & $getNode $startKey
+
+    # Degenerate: the account itself isn't a resolvable node -> treat as ManagerNotFound at depth 0.
+    if (-not (& $isResolvedNode $startNode)) {
+        return [pscustomobject]@{
+            DnKey = $startKey; ChainState = 'ManagerNotFound'
+            BreakReason = 'start-account-unresolved'; BreakDepth = 0
+            SkipLevelViable = $false; ChainToTop = @(); ReachesOrgTop = $false; Depth = 0
+            HasDisabledHop = $false
+        }
+    }
+
+    # Walk UPWARD collecting the chain (account-up order). Mirror Resolve-ManagerChain's guard.
+    $visited   = New-Object 'System.Collections.Generic.HashSet[string]'
+    $chainUp   = New-Object System.Collections.Generic.List[string]   # [account, mgr, mgr2, ... terminal]
+    $enabledUp = New-Object System.Collections.Generic.List[bool]     # parallel Enabled per chain node
+    $current   = $startKey
+    $depth     = 0
+    $cyclic    = $false
+    $notFound  = $false
+
+    while ($current -and $depth -lt $DepthCap) {
+        if (-not $visited.Add($current)) { $cyclic = $true; break }
+        $node = & $getNode $current
+        if (-not (& $isResolvedNode $node)) {
+            # A manager DN that points at an absent node / unresolved stub. (The start node is already
+            # guaranteed resolved above, so this only fires for a manager hop.)
+            $notFound = $true
+            break
+        }
+        [void]$chainUp.Add($current)
+        [void]$enabledUp.Add([bool](& $nodeEnabled $node))
+        $mgrDn  = [string](Get-OrgProp $node 'ManagerDn')
+        $mgrKey = Get-OrgDnKey $mgrDn
+        if (-not $mgrKey) { break }                 # terminal: no manager
+        if ($mgrKey -eq $current) { $cyclic = $true; break }  # self-managed = cycle
+        $current = $mgrKey
+        $depth++
+    }
+    if ($depth -ge $DepthCap -and $current -and -not $cyclic -and -not $notFound) {
+        # Ran past the cap without terminating -> treat the unbounded chain as a cycle (data-integrity).
+        $cyclic = $true
+    }
+
+    # Terminal node = last successfully-walked node (top of the resolved chain), if any.
+    $terminalKey = if ($chainUp.Count -gt 0) { $chainUp[$chainUp.Count - 1] } else { '' }
+    $anyDisabled = $false
+    foreach ($en in $enabledUp) { if (-not $en) { $anyDisabled = $true; break } }
+
+    # ---- Classify by documented precedence -------------------------------------------------------
+    if ($cyclic) {
+        $state = 'Cyclic'; $breakReason = 'chain-revisits-dn'
+        $breakDepth = ($chainUp.Count - 1); if ($breakDepth -lt 0) { $breakDepth = 0 }
+    }
+    elseif ($notFound) {
+        $state = 'ManagerNotFound'; $breakReason = 'manager-dn-unresolvable'
+        $breakDepth = $chainUp.Count   # break occurs at the hop just above the last resolved node
+    }
+    elseif ($startKey -and $topKey -and $startKey -eq $topKey) {
+        $state = 'OrgTop'; $reachesTop = $true
+    }
+    else {
+        # Did the start account even have a manager? (chainUp[0] is the account itself)
+        $startNoMgr = $false
+        if ($chainUp.Count -ge 1) {
+            $sn = & $getNode $chainUp[0]
+            $startNoMgr = [string]::IsNullOrWhiteSpace([string](Get-OrgProp $sn 'ManagerDn'))
+        }
+        if ($startNoMgr) {
+            $state = 'NoManager'; $breakReason = 'no-manager-and-not-org-top'; $breakDepth = 0
+        }
+        elseif ($topKey -and $terminalKey -eq $topKey) {
+            $reachesTop = $true
+            if ($anyDisabled) { $state = 'ManagerDisabledInChain'; $breakReason = 'manager-disabled-in-chain' }
+            else { $state = 'Healthy' }
+        }
+        else {
+            # Reached a no-manager terminal that is NOT the declared top (or no top declared).
+            $state = 'OrphanSubRoot'; $breakReason = 'terminal-not-org-top'
+            $breakDepth = ($chainUp.Count - 1); if ($breakDepth -lt 0) { $breakDepth = 0 }
+        }
+    }
+
+    # ChainToTop: CEO-down DN-key path (reverse of the upward walk).
+    $chainToTop = @($chainUp.ToArray())
+    [array]::Reverse($chainToTop)
+
+    # ---- SkipLevelViable: is the chain STRICTLY ABOVE the break a valid escalation surface? -------
+    # Find the index (in account-up order) of the first broken node. For a disabled-in-chain break
+    # that's the first disabled node; for a clean Healthy chain there is no break -> use the account
+    # itself (index 0) so "above the break" = the managers above the account.
+    if ($state -eq 'Healthy' -or $state -eq 'ManagerDisabledInChain') {
+        $breakIdx = -1
+        for ($i = 0; $i -lt $enabledUp.Count; $i++) { if (-not $enabledUp[$i]) { $breakIdx = $i; break } }
+        if ($breakIdx -lt 0) { $breakIdx = 0 }   # Healthy: nothing disabled -> measure above the account
+        # Segment strictly above the break: indices (breakIdx+1 .. end).
+        $aboveFrom = $breakIdx + 1
+        if ($aboveFrom -le ($chainUp.Count - 1)) {
+            $segOk = $true
+            for ($i = $aboveFrom; $i -lt $chainUp.Count; $i++) { if (-not $enabledUp[$i]) { $segOk = $false; break } }
+            $topsAtOrgTop = ($topKey -and ($terminalKey -eq $topKey))
+            $skipViable = ($segOk -and $topsAtOrgTop)
+        } else {
+            $skipViable = $false   # nothing above -> no skip-level target
+        }
+    }
+    else {
+        $skipViable = $false
+    }
+
+    return [pscustomobject]@{
+        DnKey           = $startKey
+        ChainState      = $state
+        BreakReason     = $breakReason
+        BreakDepth      = $breakDepth
+        SkipLevelViable = [bool]$skipViable
+        ChainToTop      = $chainToTop
+        ReachesOrgTop   = [bool]$reachesTop
+        Depth           = ($chainUp.Count - 1)
+        # HasDisabledHop: a standalone control-gap flag — TRUE when ANY node in the walked chain is
+        # disabled, INDEPENDENT of overall reachability. The ManagerDisabledInChain ChainState only
+        # fires when the chain also reaches OrgTop, so a disabled hop inside an otherwise-broken chain
+        # (OrphanSubRoot/Cyclic/ManagerNotFound) would silently lose its MGR_DISABLED_IN_CHAIN finding
+        # if callers keyed off ChainState alone. This flag lets the export fire that finding on ANY
+        # disabled hop (drift catalog sec.6: "a hop is disabled"), regardless of chain reachability.
+        HasDisabledHop  = [bool]$anyDisabled
+    }
+}
+
+# -----------------------------------------------------------------------------
+# PURE: build the versioned AD reconciliation model (Phase 2 — the product)
+# -----------------------------------------------------------------------------
+function Export-AdReconciliationModel {
+    <#
+    .SYNOPSIS  Build a stable, mergeable, per-identity AD reconciliation model (3 collections + ranked
+               join keys + recon scaffold + pre-aggregated summary) and optionally emit it as versioned
+               UTF-8 no-BOM JSON + a CSV twin. This is the AD leg of the AD<->ISC<->HR reconciliation.
+    .DESCRIPTION
+        PURE: dictionaries/arrays in -> [pscustomobject] out (+ optional file IO when -JsonPath/-CsvPath
+        set). No AD, no Get-Date, no closures over external state. The function only READS the input
+        dictionaries (never mutates them — same 'no node mutation' contract upheld by Get-OrgChainHealth).
+
+        Mirrors architecture sec.5. Three identity-keyed collections (ISC Identity/Account/Entitlement
+        shape):
+          identities[]   — one per AD account (cache .Nodes), the source-of-truth.
+          managerEdges[] — child->parent edge per identity with a resolved manager present in the map.
+          accessGrants[] — one per MemberRef (the named access evidence).
+
+        DETERMINISM IS THE CONTRACT (byte-stable diffs run-over-run):
+          - identities sorted by dnKey; accessGrants by (groupKey,dnKey); managerEdges by
+            (childDnKey,parentDnKey). All DN keys via Get-OrgDnKey.
+          - objectGuid is the stable anchor: it is a FIELD per identity, but identities are KEYED/SORTED
+            by dnKey, so a rename that keeps the GUID but changes the DN re-sorts deterministically and
+            stays ONE identity (no add/remove churn).
+          - Every hashtable that becomes a JSON object uses [ordered]@{} so key order is fixed; list
+            items are [pscustomobject] (literal property order). JSON newlines normalized to "`n" before
+            writing so re-run bytes match regardless of ConvertTo-Json line endings.
+
+        joinKeyResolved RANKS employeeID > mail > upn > samDomain, recording source+confidence by reusing
+        the Modules/UserCorrelation.ps1 tiers (email/employeeID = High, upn = Medium, sam = Low):
+          employeeId -> source 'employeeID'        confidence 'High'
+          mail       -> source 'mail'              confidence 'High'
+          upn        -> source 'userPrincipalName' confidence 'Medium'
+          samDomain  -> source 'samDomain'         confidence 'Low'  (always non-empty -> never 'None').
+
+        SCAFFOLD ONLY (P2): recon.findings stays [] and summary.headline.privilegedUnreviewable stays 0;
+        Phase 3a fills findings/headline/provenance additively. iscReviewerEmployeeId/iscActive/hrActive
+        are declared null (AD fills its side only).
+
+    .PARAMETER OrgTreeCache  @{ Metadata; Nodes } — the SAME cache shape Get-OrgChainHealth/Build-OrgTree
+                             consume. .Nodes is the DN-keyed node map carrying Dn/Sam/Display/Domain/
+                             Enabled/ManagerDn/Resolved/Synthetic/EmployeeId/Upn/ObjectGuid. Identities
+                             source-of-truth (hashtable from -FromCache OR ConvertFrom-Json object).
+    .PARAMETER MemberRefs    Output of ConvertTo-OrgMemberRefs (Dn,DnKey,Sam,Domain,Display,Group,
+                             Privileged). Source for accessGrants[] AND the per-identity privileged overlay.
+    .PARAMETER GroupResults  Optional raw GroupResults (refs already carry Group+Domain+Privileged; prefer refs).
+    .PARAMETER OrgTopDnKey   Declared OrgTop (DN or key); passed straight to Get-OrgChainHealth per identity.
+    .PARAMETER PrivilegedNamePredicate  Group-name predicate { param($name)->[bool] } (already applied to
+                             refs.Privileged; kept for parity/future).
+    .PARAMETER JoinKeyAttribute  The configured primary join key name (default 'employeeID'); drives the
+                             joinKeyCoveragePct denominator/source match. Pure passthrough.
+    .PARAMETER JsonPath      If set, write UTF-8 no-BOM JSON here.
+    .PARAMETER CsvPath       If set, write the identities CSV twin here.
+    .PARAMETER ToolVersion   Caller-supplied version string stamped into generated.toolVersion (NOT Get-Date
+                             — kept PURE/deterministic).
+    .OUTPUTS  [pscustomobject] model (returned regardless of whether files were written).
+    #>
+    [OutputType([pscustomobject])]
+    param(
+        [object]$OrgTreeCache,
+        [object[]]$MemberRefs = @(),
+        [object[]]$GroupResults = @(),
+        [string]$OrgTopDnKey = '',
+        [scriptblock]$PrivilegedNamePredicate = $null,
+        [string]$JoinKeyAttribute = 'employeeID',
+        [string]$JsonPath = '',
+        [string]$CsvPath = '',
+        [string]$ToolVersion = '',
+        # ---- P3a per-source provenance (PURE passthrough; the impure boundary computes these) --------
+        [string]$SnapshotAsOfUtc = '',   # caller-supplied; NOT Get-Date inside the function
+        [string]$ExtractedAtUtc  = '',   # caller-supplied
+        [string]$Scope           = '',   # group set / forest scope label
+        [string]$ConfigHash      = '',   # caller computes SHA-256 of effective config
+        [string]$ContentHash     = ''    # caller computes SHA-256 of the names/CSV artifact
+    )
+
+    $nodes = Get-OrgProp $OrgTreeCache 'Nodes'
+
+    # ---- Index MemberRefs by identity DnKey: privileged overlay + per-identity grant-key list -------
+    # groupKey = lowercased group name (the stable cross-source access key).
+    $refsByDn   = @{}   # dnKey -> List[ref]
+    foreach ($r in @($MemberRefs)) {
+        if ($null -eq $r) { continue }
+        $rk = [string](Get-OrgProp $r 'DnKey')
+        if ([string]::IsNullOrWhiteSpace($rk)) { $rk = Get-OrgDnKey ([string](Get-OrgProp $r 'Dn')) }
+        if ([string]::IsNullOrWhiteSpace($rk)) { continue }
+        if (-not $refsByDn.ContainsKey($rk)) { $refsByDn[$rk] = New-Object System.Collections.Generic.List[object] }
+        [void]$refsByDn[$rk].Add($r)
+    }
+
+    # ---- Resolve a ranked join key (employeeID > mail > upn > samDomain) ------------------------------
+    $resolveJoinKey = {
+        param([string]$EmpId, [string]$Mail, [string]$Upn, [string]$SamDomain)
+        if (-not [string]::IsNullOrWhiteSpace($EmpId)) { return [ordered]@{ value = $EmpId;     source = 'employeeID';        confidence = 'High'   } }
+        if (-not [string]::IsNullOrWhiteSpace($Mail))  { return [ordered]@{ value = $Mail;      source = 'mail';              confidence = 'High'   } }
+        if (-not [string]::IsNullOrWhiteSpace($Upn))   { return [ordered]@{ value = $Upn;       source = 'userPrincipalName'; confidence = 'Medium' } }
+        return [ordered]@{ value = $SamDomain; source = 'samDomain'; confidence = 'Low' }
+    }
+
+    # Derive the first OU= RDN from a DN ('' when none). DN-parse only, no escaping changes.
+    $firstOu = {
+        param([string]$Dn)
+        if ([string]::IsNullOrWhiteSpace($Dn)) { return '' }
+        $m = [regex]::Match($Dn, '(?i)(?:^|,)OU=([^,]+)')
+        if ($m.Success) { return $m.Groups[1].Value }
+        return ''
+    }
+
+    # ---- ChainState counts scaffold: fully-populated over the 7 states (stable JSON keys) ------------
+    $chainStates = @('OrgTop', 'Healthy', 'ManagerDisabledInChain', 'NoManager', 'OrphanSubRoot', 'Cyclic', 'ManagerNotFound')
+    $chainStateCounts = [ordered]@{}
+    foreach ($s in $chainStates) { $chainStateCounts[$s] = 0 }
+
+    # ---- Build identities[] (one per cache node) + managerEdges[] ------------------------------------
+    $identities = New-Object System.Collections.Generic.List[object]
+    $edges      = New-Object System.Collections.Generic.List[object]
+    $joinKeyMatchCount = 0   # identities whose resolved source == the configured join key
+    $idTotal = 0
+
+    # ---- P3a confirmed AD-only findings: per-code tallies + headline + unmatchedAd staging ----------
+    # findingCounts keys in FIXED declared order (JSON byte-stability); all six pre-populated at 0.
+    $findingCounts = [ordered]@{
+        CHAIN_BROKEN           = 0
+        PRIV_UNREVIEWABLE      = 0
+        MGR_DISABLED_IN_CHAIN  = 0
+        JOINKEY_MISSING        = 0
+        AD_NOT_IN_HR           = 0
+        MAIL_NE_UPN            = 0
+    }
+    $privUnreviewableCount = 0
+    $unmatchedAd = New-Object System.Collections.Generic.List[object]
+
+    foreach ($e in (Get-OrgNodeEntries $nodes)) {
+        $node  = $e.Node
+        $dn    = [string](Get-OrgProp $node 'Dn')
+        $dnKey = if ([string]::IsNullOrWhiteSpace($e.Key)) { Get-OrgDnKey $dn } else { (Get-OrgDnKey $e.Key) }
+        if ([string]::IsNullOrWhiteSpace($dnKey)) { continue }
+
+        # ---- Skip synthetic / unresolved manager STUB nodes (NOT real AD accounts) -------------------
+        # The real CLI paths (ConvertTo-OrgTreeCacheFromRecords + the live deep walk) fabricate a
+        # Resolved=$false / Synthetic=$true stub for every manager DN that isn't itself an enumerated
+        # member. Architecture sec.5 defines identities[] as "one per AD account"; a manager stub is not
+        # an account. Emitting it would: (1) create a phantom identity with sam='' whose joinKeyResolved
+        # falls to {source:'samDomain'} with an EMPTY value — violating the documented "samDomain always
+        # non-empty -> never None" invariant; (2) fabricate JOINKEY_MISSING/AD_NOT_IN_HR/CHAIN_BROKEN
+        # findings and an empty-sam unmatchedAd row; (3) inflate collectionCounts/recordCount/findingCounts
+        # and the joinKeyCoveragePct denominator. So skip such nodes entirely (additive; resolved nodes
+        # — Resolved absent => default true, or Resolved=$true — are unaffected).
+        $resolvedProp  = Get-OrgProp $node 'Resolved'
+        $isResolved    = if ($null -eq $resolvedProp) { $true } else { [bool]$resolvedProp }
+        $syntheticProp = Get-OrgProp $node 'Synthetic'
+        $isSynthetic   = if ($null -eq $syntheticProp) { $false } else { [bool]$syntheticProp }
+        if ((-not $isResolved) -or $isSynthetic) { continue }
+
+        $sam     = [string](Get-OrgProp $node 'Sam')
+        $domain  = [string](Get-OrgProp $node 'Domain')
+        $display = [string](Get-OrgProp $node 'Display')
+        $empId   = [string](Get-OrgProp $node 'EmployeeId')
+        $upn     = [string](Get-OrgProp $node 'Upn')
+        $mail    = [string](Get-OrgProp $node 'Mail')   # staged onto node (record path: member.Email; live path: LDAP mail)
+        $guid    = [string](Get-OrgProp $node 'ObjectGuid')
+        $en      = Get-OrgProp $node 'Enabled'; $enabled = if ($null -eq $en) { $true } else { [bool]$en }
+        $ou      = & $firstOu $dn
+        $samDomain = if ($sam) { "$domain\$sam" } else { '' }
+
+        # Privileged overlay: TRUE if ANY MemberRef for this dnKey is privileged.
+        $privileged = $false
+        $idGrantKeys = New-Object System.Collections.Generic.List[string]
+        if ($refsByDn.ContainsKey($dnKey)) {
+            foreach ($r in $refsByDn[$dnKey]) {
+                if ([bool](Get-OrgProp $r 'Privileged')) { $privileged = $true }
+                $gk = ([string](Get-OrgProp $r 'Group')).ToLowerInvariant()
+                if ($gk) { [void]$idGrantKeys.Add($gk) }
+            }
+        }
+        $myGrantKeys = @($idGrantKeys | Sort-Object -Unique)
+
+        # Manager block: look up the manager node via Get-OrgDnKey(ManagerDn).
+        $mgrDn  = [string](Get-OrgProp $node 'ManagerDn')
+        $mgrKey = Get-OrgDnKey $mgrDn
+        $mgrNode = $null
+        if ($mgrKey) {
+            if ($nodes -is [System.Collections.IDictionary]) { if ($nodes.Contains($mgrKey)) { $mgrNode = $nodes[$mgrKey] } }
+            else { $mp = $nodes.PSObject.Properties[$mgrKey]; if ($mp) { $mgrNode = $mp.Value } }
+        }
+        $mgrResolved = $false
+        $mgrEmpId    = ''
+        $mgrEnabled  = $true
+        if ($null -ne $mgrNode) {
+            $mr = Get-OrgProp $mgrNode 'Resolved'
+            $mgrResolved = if ($null -eq $mr) { $true } else { [bool]$mr }
+            if ($mgrResolved) { $mgrEmpId = [string](Get-OrgProp $mgrNode 'EmployeeId') }
+            $me = Get-OrgProp $mgrNode 'Enabled'; $mgrEnabled = if ($null -eq $me) { $true } else { [bool]$me }
+        }
+
+        # Chain health (declared OrgTop distinguishes Healthy from OrphanSubRoot).
+        $health = Get-OrgChainHealth -Nodes $nodes -DnKey $dnKey -OrgTopDnKey $OrgTopDnKey
+        $state  = [string]$health.ChainState
+        if ($chainStateCounts.Contains($state)) { $chainStateCounts[$state] = $chainStateCounts[$state] + 1 }
+
+        $jk = & $resolveJoinKey $empId $mail $upn $samDomain
+        # joinKeyCoveragePct KPI: an 'employeeID'-source hit means the configured JoinKeyAttribute was
+        # populated. GroupEnumerator.ps1 maps the configured attribute (employeeID by default, but also
+        # employeeNumber / a custom extensionAttribute per architecture sec.3) UPSTREAM into the node's
+        # EmployeeId field, so the ranked source label is always the literal 'employeeID' regardless of
+        # which attribute name was configured. Treat that 'employeeID' source as satisfying ANY configured
+        # JoinKeyAttribute; also accept an exact source==JoinKeyAttribute match for non-default cases where
+        # a later tier happens to be named after the configured attribute. (Was: literal-'employeeID'
+        # branch only fired when JoinKeyAttribute -ieq 'employeeID', collapsing coverage to 0% for custom
+        # join keys even when every account carried it.)
+        if ([string]$jk.source -eq 'employeeID') { $joinKeyMatchCount++ }
+        elseif ([string]$jk.source -eq $JoinKeyAttribute) { $joinKeyMatchCount++ }
+        $idTotal++
+
+        # ---- P3a confirmed AD-only findings (process language, no blame; status always 'confirmed') --
+        # Each finding: FIXED key order code/severity/status/message/subjectDnKey/subjectJoinKey.
+        # CHAIN_BROKEN underlies PRIV_UNREVIEWABLE (privileged overlay). Determinism: sorted by code below.
+        $idFindings = New-Object System.Collections.Generic.List[object]
+        $subjectJk  = [string]$jk.value
+        $empMissing = [string]::IsNullOrWhiteSpace($empId)
+        # The chain is "broken" (cannot route a review to OrgTop) when it does not reach the declared top
+        # AND the account is not the OrgTop itself. NoManager/OrphanSubRoot/Cyclic/ManagerNotFound qualify;
+        # ManagerDisabledInChain still reachesOrgTop=true so it is NOT a CHAIN_BROKEN (handled separately).
+        $chainBroken = ((-not $health.ReachesOrgTop) -and ($state -ne 'OrgTop'))
+
+        if ($empMissing) {
+            $sev = if ($privileged) { 'High' } else { 'Medium' }
+            $idFindings.Add([pscustomobject]@{
+                code = 'JOINKEY_MISSING'; severity = $sev; status = 'confirmed'
+                message = 'No employeeID present; cross-source join falls back to a weaker key.'
+                subjectDnKey = $dnKey; subjectJoinKey = $subjectJk
+            }) | Out-Null
+            $findingCounts['JOINKEY_MISSING'] = $findingCounts['JOINKEY_MISSING'] + 1
+
+            # AD_NOT_IN_HR: no HR/SuccessFactors anchor key (proxy = no employeeID for AD-only P3a).
+            $idFindings.Add([pscustomobject]@{
+                code = 'AD_NOT_IN_HR'; severity = 'Medium'; status = 'confirmed'
+                message = 'AD account has no HR anchor key; staged for HR reconciliation.'
+                subjectDnKey = $dnKey; subjectJoinKey = $subjectJk
+            }) | Out-Null
+            $findingCounts['AD_NOT_IN_HR'] = $findingCounts['AD_NOT_IN_HR'] + 1
+            $unmatchedAd.Add([pscustomobject]@{
+                dnKey = $dnKey; objectGuid = $guid; sam = $sam; samDomain = $samDomain; reason = 'no-hr-anchor-key'
+            }) | Out-Null
+        }
+
+        if ($chainBroken) {
+            $idFindings.Add([pscustomobject]@{
+                code = 'CHAIN_BROKEN'; severity = 'High'; status = 'confirmed'
+                message = ('Manager chain does not reach the declared org top (state {0}; {1}); the access review cannot route to an independent approver.' -f $state, $(if ($health.BreakReason) { $health.BreakReason } else { 'no-route' }))
+                subjectDnKey = $dnKey; subjectJoinKey = $subjectJk
+            }) | Out-Null
+            $findingCounts['CHAIN_BROKEN'] = $findingCounts['CHAIN_BROKEN'] + 1
+
+            if ($privileged) {
+                # PRIV_UNREVIEWABLE: the headline overlay (CHAIN_BROKEN AND privileged). Fires IN ADDITION.
+                $idFindings.Add([pscustomobject]@{
+                    code = 'PRIV_UNREVIEWABLE'; severity = 'Critical'; status = 'confirmed'
+                    message = 'Privileged account whose access review cannot route to a valid approver (broken manager chain).'
+                    subjectDnKey = $dnKey; subjectJoinKey = $subjectJk
+                }) | Out-Null
+                $findingCounts['PRIV_UNREVIEWABLE'] = $findingCounts['PRIV_UNREVIEWABLE'] + 1
+                $privUnreviewableCount++
+            }
+        }
+
+        # MGR_DISABLED_IN_CHAIN fires on ANY disabled hop in the chain, INDEPENDENT of overall
+        # reachability (drift catalog sec.6: "a hop is disabled"). Get-OrgChainHealth only assigns the
+        # ManagerDisabledInChain ChainState when the chain ALSO reaches OrgTop; a disabled hop inside an
+        # otherwise-broken chain (OrphanSubRoot/Cyclic/ManagerNotFound) would silently lose this confirmed
+        # SOX finding if we keyed off the state alone. So key off the standalone HasDisabledHop flag — it
+        # co-fires alongside CHAIN_BROKEN when both gaps are present in the same chain.
+        if ([bool]$health.HasDisabledHop) {
+            $idFindings.Add([pscustomobject]@{
+                code = 'MGR_DISABLED_IN_CHAIN'; severity = 'Medium'; status = 'confirmed'
+                message = 'A manager in the chain is disabled; a hop needs time-bound remediation regardless of whether the chain reaches the org top.'
+                subjectDnKey = $dnKey; subjectJoinKey = $subjectJk
+            }) | Out-Null
+            $findingCounts['MGR_DISABLED_IN_CHAIN'] = $findingCounts['MGR_DISABLED_IN_CHAIN'] + 1
+        }
+
+        if ((-not [string]::IsNullOrWhiteSpace($mail)) -and (-not [string]::IsNullOrWhiteSpace($upn)) -and ($mail -ine $upn)) {
+            $idFindings.Add([pscustomobject]@{
+                code = 'MAIL_NE_UPN'; severity = 'Low'; status = 'confirmed'
+                message = 'mail and userPrincipalName diverge; the email-based cross-source join surface is weaker.'
+                subjectDnKey = $dnKey; subjectJoinKey = $subjectJk
+            }) | Out-Null
+            $findingCounts['MAIL_NE_UPN'] = $findingCounts['MAIL_NE_UPN'] + 1
+        }
+
+        $idFindingsSorted = @($idFindings | Sort-Object -Property code)
+
+        $identities.Add([pscustomobject]@{
+            dnKey       = $dnKey
+            objectGuid  = $guid
+            sam         = $sam
+            domain      = $domain
+            ou          = $ou
+            displayName = $display
+            joinKeys    = [ordered]@{ employeeId = $empId; mail = $mail; upn = $upn; samDomain = $samDomain }
+            joinKeyResolved = [ordered]@{ value = [string]$jk.value; source = [string]$jk.source; confidence = [string]$jk.confidence }
+            enabled     = $enabled
+            privileged  = $privileged
+            manager     = [ordered]@{ dnKey = $mgrKey; employeeId = $mgrEmpId; resolved = $mgrResolved }
+            chain       = [ordered]@{
+                toTop           = @($health.ChainToTop)
+                depth           = [int]$health.Depth
+                state           = $state
+                breakReason     = $health.BreakReason
+                breakDepth      = $health.BreakDepth
+                skipLevelViable = [bool]$health.SkipLevelViable
+                reachesOrgTop   = [bool]$health.ReachesOrgTop
+            }
+            accessGrants = $myGrantKeys
+            recon       = [ordered]@{
+                adManagerEmployeeId    = $mgrEmpId
+                iscReviewerEmployeeId  = $null
+                iscActive              = $null
+                hrActive               = $null
+                findings               = @($idFindingsSorted)
+            }
+        }) | Out-Null
+
+        # managerEdge: only when the manager node is present AND resolved (a real parent in the map).
+        if ($mgrKey -and $null -ne $mgrNode -and $mgrResolved) {
+            $depthFromTop = if ($null -ne $health.Depth) { [int]$health.Depth } else { -1 }
+            $edges.Add([pscustomobject]@{
+                childDnKey       = $dnKey
+                childEmployeeId  = $empId
+                parentDnKey      = $mgrKey
+                parentEmployeeId = $mgrEmpId
+                childEnabled     = $enabled
+                parentEnabled    = $mgrEnabled
+                depthFromTop     = $depthFromTop
+            }) | Out-Null
+        }
+    }
+
+    # ---- Build top-level accessGrants[] (one per MemberRef) ------------------------------------------
+    $grants = New-Object System.Collections.Generic.List[object]
+    foreach ($r in @($MemberRefs)) {
+        if ($null -eq $r) { continue }
+        $rk = [string](Get-OrgProp $r 'DnKey')
+        if ([string]::IsNullOrWhiteSpace($rk)) { $rk = Get-OrgDnKey ([string](Get-OrgProp $r 'Dn')) }
+        $gname = [string](Get-OrgProp $r 'Group')
+        $grants.Add([pscustomobject]@{
+            dnKey      = $rk
+            groupKey   = $gname.ToLowerInvariant()
+            groupName  = $gname
+            domain     = [string](Get-OrgProp $r 'Domain')
+            privileged = [bool](Get-OrgProp $r 'Privileged')
+            nested     = $false
+            viaGroup   = ''
+        }) | Out-Null
+    }
+
+    # ---- SORT all three collections (the determinism contract) --------------------------------------
+    $identitiesSorted = @($identities | Sort-Object -Property dnKey)
+    $edgesSorted      = @($edges | Sort-Object -Property childDnKey, parentDnKey)
+    $grantsSorted     = @($grants | Sort-Object -Property groupKey, dnKey)
+    $unmatchedAdSorted = @($unmatchedAd | Sort-Object -Property dnKey)
+
+    # ---- joinKeyCoveragePct: % of identities whose resolved source is the configured join key --------
+    $coveragePct = if ($idTotal -gt 0) { [int][math]::Round((($joinKeyMatchCount / $idTotal) * 100), 0) } else { 0 }
+
+    $summary = [ordered]@{
+        byDivision        = @()
+        chainStateCounts  = $chainStateCounts
+        headline          = [ordered]@{ privilegedUnreviewable = $privUnreviewableCount }
+        joinKeyCoveragePct = $coveragePct
+        findingCounts     = $findingCounts
+    }
+
+    $model = [pscustomobject]@{
+        schemaVersion = '1.0.0'
+        generated     = [ordered]@{
+            toolVersion      = $ToolVersion
+            collectionCounts = [ordered]@{
+                identities   = @($identitiesSorted).Count
+                managerEdges = @($edgesSorted).Count
+                accessGrants = @($grantsSorted).Count
+                unmatchedAd  = @($unmatchedAdSorted).Count
+            }
+            # ---- P3a per-source provenance (AD filled; ISC/HR declared-but-empty) ----
+            provenance = [ordered]@{
+                ad  = [ordered]@{ sourceSystem = 'AD';  authority = 'downstream';    snapshotAsOfUtc = $SnapshotAsOfUtc; extractedAtUtc = $ExtractedAtUtc; toolVersion = $ToolVersion; scope = $Scope; recordCount = @($identitiesSorted).Count; configHash = $ConfigHash; contentHash = $ContentHash }
+                isc = [ordered]@{ sourceSystem = 'ISC'; authority = 'downstream';    snapshotAsOfUtc = $null;            extractedAtUtc = $null;           toolVersion = $null;        scope = $null;   recordCount = $null;                          configHash = $null;       contentHash = $null }
+                hr  = [ordered]@{ sourceSystem = 'HR';  authority = 'authoritative'; snapshotAsOfUtc = $null;            extractedAtUtc = $null;           toolVersion = $null;        scope = $null;   recordCount = $null;                          configHash = $null;       contentHash = $null }
+            }
+        }
+        identities    = @($identitiesSorted)
+        managerEdges  = @($edgesSorted)
+        accessGrants  = @($grantsSorted)
+        unmatchedAd   = @($unmatchedAdSorted)
+        summary       = $summary
+    }
+
+    # ---- Emit JSON (UTF-8 no-BOM, newline-normalized for byte-stability) ----------------------------
+    if (-not [string]::IsNullOrWhiteSpace($JsonPath)) {
+        $json = $model | ConvertTo-Json -Depth 12
+        $json = $json -replace "`r`n", "`n"
+        [System.IO.File]::WriteAllText($JsonPath, $json, [System.Text.UTF8Encoding]::new($false))
+    }
+
+    # ---- Emit CSV twin (flat identity rows, no-BOM, newline-normalized) ------------------------------
+    if (-not [string]::IsNullOrWhiteSpace($CsvPath)) {
+        $rows = foreach ($i in $identitiesSorted) {
+            [pscustomobject]@{
+                dnKey             = $i.dnKey
+                objectGuid        = $i.objectGuid
+                sam               = $i.sam
+                domain            = $i.domain
+                ou                = $i.ou
+                displayName       = $i.displayName
+                employeeId        = $i.joinKeys.employeeId
+                mail              = $i.joinKeys.mail
+                upn               = $i.joinKeys.upn
+                samDomain         = $i.joinKeys.samDomain
+                joinKeyValue      = $i.joinKeyResolved.value
+                joinKeySource     = $i.joinKeyResolved.source
+                joinKeyConfidence = $i.joinKeyResolved.confidence
+                enabled           = $i.enabled
+                privileged        = $i.privileged
+                managerDnKey      = $i.manager.dnKey
+                managerEmployeeId = $i.manager.employeeId
+                chainState        = $i.chain.state
+                reachesOrgTop     = $i.chain.reachesOrgTop
+                skipLevelViable   = $i.chain.skipLevelViable
+                breakReason       = $i.chain.breakReason
+                chainDepth        = $i.chain.depth
+                accessGrantCount  = @($i.accessGrants).Count
+                findingCount      = @($i.recon.findings).Count
+                findingCodes      = (@($i.recon.findings | ForEach-Object { $_.code }) -join ';')
+            }
+        }
+        $csv = @($rows) | ConvertTo-Csv -NoTypeInformation
+        $csvText = ($csv -join "`n")
+        $csvText = $csvText -replace "`r`n", "`n"
+        [System.IO.File]::WriteAllText($CsvPath, $csvText, [System.Text.UTF8Encoding]::new($false))
+    }
+
+    return $model
 }
 
 # -----------------------------------------------------------------------------
@@ -1014,7 +1682,8 @@ function New-OrgAdLookup {
                over an ADLdap connection pool. A $null result means the DN is in an unreachable /
                untrusted domain (the chain stops there - a documented limitation, not a bug).
     #>
-    param([Parameter(Mandatory = $true)][hashtable]$Pool, [int]$TimeoutSeconds = 120)
+    param([Parameter(Mandatory = $true)][hashtable]$Pool, [int]$TimeoutSeconds = 120, [string]$JoinKeyAttribute = 'employeeID')
+    $joinKeyLower = $JoinKeyAttribute.ToLowerInvariant()
     # Capture the helper FUNCTIONS as scriptblock variables so GetNewClosure() snapshots them.
     # GetNewClosure captures variables, NOT functions, so referencing these by name inside the
     # returned closure fails with "X is not recognized" when it runs from Build-OrgTreeCache's scope
@@ -1037,14 +1706,23 @@ function New-OrgAdLookup {
         $res = $null
         try {
             $res = & $fnSearch -Context $ctx -BaseDN $Dn -Scope Base -Filter '(objectClass=*)' `
-                -Attributes @('manager', 'sAMAccountName', 'displayName', 'userAccountControl') -TimeoutSeconds $TimeoutSeconds
+                -Attributes @('manager', 'sAMAccountName', 'displayName', 'userAccountControl', $JoinKeyAttribute, 'userPrincipalName', 'mail', 'objectGUID') `
+                -BinaryAttributes @('objectGUID') -TimeoutSeconds $TimeoutSeconds
         } catch { return $null }
         if (-not $res -or @($res).Count -eq 0) { return $null }
         $e = @($res)[0]
         $uac = 0; [void][int]::TryParse([string]$e['userAccountControl'], [ref]$uac)
+        # objectGUID is binary -> stable GUID string; never emit raw bytes (malformed -> '').
+        $objGuid = ''
+        if ($e.Contains('objectguid') -and $e['objectguid']) { try { $objGuid = ([guid][byte[]]$e['objectguid']).ToString() } catch { $objGuid = '' } }
+        elseif ($e.Contains('objectGUID') -and $e['objectGUID']) { try { $objGuid = ([guid][byte[]]$e['objectGUID']).ToString() } catch { $objGuid = '' } }
+        $empId = if ($e.Contains($joinKeyLower)) { [string]$e[$joinKeyLower] } elseif ($e.Contains($JoinKeyAttribute)) { [string]$e[$JoinKeyAttribute] } else { '' }
+        $upn = if ($e.Contains('userprincipalname')) { [string]$e['userprincipalname'] } elseif ($e.Contains('userPrincipalName')) { [string]$e['userPrincipalName'] } else { '' }
+        $mail = if ($e.Contains('mail')) { [string]$e['mail'] } elseif ($e.Contains('Mail')) { [string]$e['Mail'] } else { '' }
         return @{
             Dn = [string]$e['DistinguishedName']; Sam = [string]$e['sAMAccountName']; Display = [string]$e['displayName']
             Domain = (& $fnDomain $Dn); Enabled = (-not ($uac -band 2)); ManagerDn = [string]$e['manager']; Resolved = $true
+            EmployeeId = $empId; Upn = $upn; Mail = $mail; ObjectGuid = $objGuid
         }
     }.GetNewClosure()
 }
@@ -1077,13 +1755,13 @@ function Resolve-ManagerChain {
         $rec = & $LookupFn $current
         if ($null -eq $rec) {
             if (-not $NodeCache.ContainsKey($key)) {
-                $NodeCache[$key] = @{ Dn = $current; Sam = ''; Display = ''; Domain = (Get-OrgDomainFromDn $current); Enabled = $true; ManagerDn = $null; Resolved = $false; Synthetic = $true }
+                $NodeCache[$key] = @{ Dn = $current; Sam = ''; Display = ''; Domain = (Get-OrgDomainFromDn $current); Enabled = $true; ManagerDn = $null; Resolved = $false; Synthetic = $true; EmployeeId = ''; Upn = ''; Mail = ''; ObjectGuid = '' }
             }
             $ResolvedThisRun[$key] = $true
             if ($Stats) { $Stats.Unresolved++ }
             break
         }
-        $NodeCache[$key] = @{ Dn = $rec.Dn; Sam = $rec.Sam; Display = $rec.Display; Domain = $rec.Domain; Enabled = [bool]$rec.Enabled; ManagerDn = $rec.ManagerDn; Resolved = $true; Synthetic = $false }
+        $NodeCache[$key] = @{ Dn = $rec.Dn; Sam = $rec.Sam; Display = $rec.Display; Domain = $rec.Domain; Enabled = [bool]$rec.Enabled; ManagerDn = $rec.ManagerDn; Resolved = $true; Synthetic = $false; EmployeeId = [string]$rec.EmployeeId; Upn = [string]$rec.Upn; Mail = [string]$rec.Mail; ObjectGuid = [string]$rec.ObjectGuid }
         $ResolvedThisRun[$key] = $true
         $current = $rec.ManagerDn
         $depth++

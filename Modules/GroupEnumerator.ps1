@@ -320,10 +320,15 @@ function script:Resolve-MemberDnToRecord {
         [Parameter(Mandatory = $true)]  [string]$LocalDomain,
         [Parameter(Mandatory = $false)] [hashtable]$Pool,
         [Parameter(Mandatory = $false)] [int]$TimeoutSeconds = 120,
-        [Parameter(Mandatory = $false)] [string[]]$IncludeAttributes = @()
+        [Parameter(Mandatory = $false)] [string[]]$IncludeAttributes = @(),
+        [Parameter(Mandatory = $false)] [string]$JoinKeyAttribute = 'employeeID'
     )
 
-    $userAttrs = @('sAMAccountName','displayName','mail','userAccountControl','distinguishedName')
+    # First-class join/anchor attributes carried end-to-end for AD<->ISC<->HR reconciliation.
+    # employeeID (or a configurable JoinKeyAttribute) is the ranked join key; objectGUID is the
+    # stable identity anchor (binary -> GUID string); userPrincipalName is the mail<->UPN check.
+    $joinKeyLower = $JoinKeyAttribute.ToLowerInvariant()
+    $userAttrs = @('sAMAccountName','displayName','mail','userAccountControl','distinguishedName',$JoinKeyAttribute,'userPrincipalName','objectGUID')
     $extraAttrs = @($IncludeAttributes | Where-Object { $_ } | ForEach-Object { $_.Trim() })
     if ($extraAttrs.Count -gt 0) {
         $userAttrs = $userAttrs + $extraAttrs
@@ -333,6 +338,12 @@ function script:Resolve-MemberDnToRecord {
     $buildMemberRecord = {
         param([hashtable]$m, [string]$domain)
         $uac = if ($m.ContainsKey('userAccountControl')) { [int]$m.userAccountControl } else { 0 }
+        # objectGUID arrives as raw bytes (requested via -BinaryAttributes); convert to a stable
+        # GUID string. NEVER emit raw bytes. Defensive: malformed bytes -> $null (mirrors objectSid).
+        $objGuid = $null
+        if ($m.ContainsKey('objectguid') -and $m.objectguid) {
+            try { $objGuid = ([guid][byte[]]$m.objectguid).ToString() } catch { $objGuid = $null }
+        }
         $record = @{
             SamAccountName    = if ($m.ContainsKey('sAMAccountName')) { $m.sAMAccountName } else { $null }
             DisplayName       = if ($m.ContainsKey('displayName'))    { $m.displayName }    else { $null }
@@ -340,6 +351,9 @@ function script:Resolve-MemberDnToRecord {
             Enabled           = (($uac -band 2) -eq 0)
             Domain            = $domain
             DistinguishedName = $m.DistinguishedName
+            EmployeeID        = if ($m.ContainsKey($joinKeyLower)) { [string]$m.$joinKeyLower } elseif ($m.ContainsKey($JoinKeyAttribute)) { [string]$m.$JoinKeyAttribute } else { $null }
+            UserPrincipalName = if ($m.ContainsKey('userprincipalname')) { [string]$m.userprincipalname } else { $null }
+            ObjectGuid        = $objGuid
         }
         # Add extra requested attributes
         foreach ($attr in $extraAttrs) {
@@ -379,6 +393,9 @@ function script:Resolve-MemberDnToRecord {
         Enabled           = $null
         Domain            = $LocalDomain
         DistinguishedName = $MemberDN
+        EmployeeID        = $null
+        UserPrincipalName = $null
+        ObjectGuid        = $null
     }
 
     # --- FSP indirection: resolve SID via foreign pooled context ---
@@ -418,6 +435,7 @@ function script:Resolve-MemberDnToRecord {
             $userHit = Invoke-AdLdapSearch -Context $target -BaseDN $target.BaseDN -Scope Subtree `
                 -Filter "(&(objectCategory=person)(objectSid=$sidFilter))" `
                 -Attributes $userAttrs `
+                -BinaryAttributes @('objectGUID') `
                 -TimeoutSeconds $TimeoutSeconds
         } catch { return $partial }
         if ($userHit.Count -eq 0) { return $partial }
@@ -446,6 +464,7 @@ function script:Resolve-MemberDnToRecord {
         $hit = Invoke-AdLdapSearch -Context $queryCtx -BaseDN $MemberDN `
             -Filter '(objectCategory=person)' -Scope Base `
             -Attributes $userAttrs `
+            -BinaryAttributes @('objectGUID') `
             -TimeoutSeconds $TimeoutSeconds
     } catch {
         return $partial
@@ -585,7 +604,8 @@ function Get-GroupMembersDirect {
         [Parameter(Mandatory = $false)] [hashtable]$ConnectionPool,
         [Parameter(Mandatory = $false)] [string[]]$IncludeAttributes = @(),
         [Parameter(Mandatory = $false)] [switch]$CaptureNesting,
-        [Parameter(Mandatory = $false)] [switch]$GroupIsDistinguishedName
+        [Parameter(Mandatory = $false)] [switch]$GroupIsDistinguishedName,
+        [Parameter(Mandatory = $false)] [string]$JoinKeyAttribute = 'employeeID'
     )
 
     $errors        = @()
@@ -756,7 +776,7 @@ function Get-GroupMembersDirect {
                 $record = Resolve-MemberDnToRecord -MemberDN $memberDN `
                     -LocalContext $ctx -LocalDomain $Domain `
                     -Pool $ConnectionPool -TimeoutSeconds $timeoutSeconds `
-                    -IncludeAttributes $IncludeAttributes
+                    -IncludeAttributes $IncludeAttributes -JoinKeyAttribute $JoinKeyAttribute
                 $members += $record
             } catch {
                 $errors += "Failed to query member '$memberDN': $($_.Exception.Message.Trim())"
@@ -835,7 +855,10 @@ function Get-GroupMembers {
         [switch]$CaptureNesting,
 
         [Parameter(Mandatory = $false)]
-        [switch]$GroupIsDistinguishedName
+        [switch]$GroupIsDistinguishedName,
+
+        [Parameter(Mandatory = $false)]
+        [string]$JoinKeyAttribute = 'employeeID'
     )
 
     $errors = @()
@@ -856,10 +879,11 @@ function Get-GroupMembers {
 
     try {
         $directParams = @{
-            Domain     = $Domain
-            GroupName  = $GroupName
-            Credential = $Credential
-            Config     = $Config
+            Domain           = $Domain
+            GroupName        = $GroupName
+            Credential       = $Credential
+            Config           = $Config
+            JoinKeyAttribute = $JoinKeyAttribute
         }
         if ($ConnectionPool) { $directParams.ConnectionPool = $ConnectionPool }
         if ($IncludeAttributes.Count -gt 0) { $directParams.IncludeAttributes = $IncludeAttributes }

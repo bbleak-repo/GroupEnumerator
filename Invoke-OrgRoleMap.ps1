@@ -40,6 +40,9 @@
 .PARAMETER PrivConcentrationPct   PrivConcentration gate: one top branch holds >= this % (default 60).
 .PARAMETER ExportCsv    Also write the placement rows (org path, group, count) to this CSV.
 .PARAMETER OutputHtml   Write the HTML report to this path.
+.PARAMETER ReconExport  Write the AD reconciliation model (versioned JSON + CSV twin) to this path. Additive.
+.PARAMETER OrgTop       Declared org-top sAMAccountName (falls back to config OrgTopSam); resolved to a DnKey via the loaded org tree to distinguish Healthy from OrphanSubRoot.
+.PARAMETER JoinKeyAttribute  Primary join-key attribute name (falls back to config JoinKeyAttribute, default employeeID); threaded to the reconciliation export.
 .PARAMETER Quiet        Print only the summary + verdict.
 
 .EXAMPLE
@@ -72,11 +75,14 @@ param(
     [string]$Server,
     [switch]$AllowInsecure,
     [ValidateRange(0, 36500)][int]$MaxStaleDays = 30,
-    [ValidateSet('StaleCache', 'UnmanagedBucket', 'PrivConcentration')][string[]]$FailOn = @(),
+    [ValidateSet('StaleCache', 'UnmanagedBucket', 'PrivConcentration', 'SingleRootBroken', 'PrivilegedUnroutable')][string[]]$FailOn = @(),
     [ValidateRange(0, 100)][int]$UnmanagedFailPct = 25,
     [ValidateRange(0, 100)][int]$PrivConcentrationPct = 60,
     [string]$ExportCsv,
     [string]$OutputHtml,
+    [string]$ReconExport,
+    [string]$OrgTop,
+    [string]$JoinKeyAttribute,
     [switch]$Quiet
 )
 
@@ -123,6 +129,10 @@ $svcOUs  = if ($ServiceAccountOU) { $ServiceAccountOU } elseif ($cfgPriv -and $c
 $svcPats = if ($ServiceAccountPattern) { $ServiceAccountPattern } elseif ($cfgPriv -and $cfgPriv.ServiceAccountPatterns) { @($cfgPriv.ServiceAccountPatterns) } else { @() }
 $svcPred = if ($svcOUs.Count -gt 0 -or $svcPats.Count -gt 0) { New-OrgServiceAccountPredicate -OrgUnits $svcOUs -NamePatterns $svcPats } else { $null }
 if ($svcPred) { Write-Host ("  (service accounts: OU [{0}]{1})" -f ($svcOUs -join ', '), $(if ($svcPats.Count) { ' + pattern [' + ($svcPats -join ', ') + ']' } else { '' })) -ForegroundColor DarkGray }
+
+# Reconciliation export config fallbacks (reuse the already-loaded $cfgPriv; do NOT re-read config).
+$joinKeyAttr = if ($PSBoundParameters.ContainsKey('JoinKeyAttribute') -and $JoinKeyAttribute) { $JoinKeyAttribute } elseif ($cfgPriv -and $cfgPriv.JoinKeyAttribute) { [string]$cfgPriv.JoinKeyAttribute } else { 'employeeID' }
+$orgTopSam   = if ($PSBoundParameters.ContainsKey('OrgTop') -and $OrgTop) { $OrgTop } elseif ($cfgPriv -and $cfgPriv.OrgTopSam) { [string]$cfgPriv.OrgTopSam } else { '' }
 
 $orgTreeFile = Resolve-LocalPath $OrgTreePath (Join-Path $scriptRoot (Join-Path 'State' 'org-tree.json'))
 
@@ -274,6 +284,58 @@ if ($OutputHtml) {
     catch { Write-Host "  [warn] -OutputHtml failed: $_" -ForegroundColor Yellow }
 }
 
+# ---- Reconciliation export (additive; emit the versioned AD model JSON + CSV twin) ----
+$reconModel = $null
+if ($ReconExport) {
+    try {
+        $reconJson = $ReconExport
+        $reconCsv  = [System.IO.Path]::ChangeExtension($ReconExport, '.csv')
+
+        # ---- Per-source provenance inputs (THE impure boundary; the PURE export only stamps these) ----
+        $sha256Hex = {
+            param([byte[]]$Bytes)
+            $h = [System.Security.Cryptography.SHA256]::Create()
+            try { ([System.BitConverter]::ToString($h.ComputeHash($Bytes)) -replace '-', '').ToLowerInvariant() }
+            finally { $h.Dispose() }
+        }
+        $snapNow = (Get-Date).ToUniversalTime().ToString('o')
+        $snapshotAsOf = if ($builtUtc) { [string]$builtUtc } else { $snapNow }
+        # configHash: SHA-256 of the effective config file bytes (empty-string hash when absent -> deterministic).
+        $configBytes = if (Test-Path -LiteralPath $cfgFileP) { [System.IO.File]::ReadAllBytes($cfgFileP) } else { [System.Text.Encoding]::UTF8.GetBytes('') }
+        $configHash  = & $sha256Hex $configBytes
+        # contentHash: SHA-256 of the named detail artifact. Prefer the placement CSV ($ExportCsv) if it was
+        # written; else a stable serialization of $refs (sorted "dnKey|group|domain" lines joined by `n).
+        $contentBytes =
+            if ($ExportCsv -and (Test-Path -LiteralPath $ExportCsv)) {
+                [System.IO.File]::ReadAllBytes($ExportCsv)
+            } else {
+                $lines = @($refs | ForEach-Object { ('{0}|{1}|{2}' -f (Get-OrgDnKey ([string]$_.Dn)), ([string]$_.Group), ([string]$_.Domain)) } | Sort-Object)
+                [System.Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))
+            }
+        $contentHash = & $sha256Hex $contentBytes
+        $reconScope  = ($Mode + $(if ($Groups) { ':' + ($Groups -join ',') } else { '' }))
+
+        # Resolve the declared OrgTop sAMAccountName -> DnKey via the loaded org-tree cache.
+        $orgTopDnKey = ''
+        if ($orgTopSam) {
+            foreach ($en in (Get-OrgNodeEntries $orgTreeCache.Nodes)) {
+                if (([string](Get-OrgProp $en.Node 'Sam')) -ieq $orgTopSam) {
+                    $dn = [string](Get-OrgProp $en.Node 'Dn')
+                    $orgTopDnKey = if ($dn) { Get-OrgDnKey $dn } else { Get-OrgDnKey $en.Key }
+                    break
+                }
+            }
+            if (-not $orgTopDnKey) { Write-Rag 'WARN' "Declared OrgTop sam '$orgTopSam' not found in the org tree; export proceeds with no declared top (clean terminals read as OrphanSubRoot)." }
+        }
+
+        $reconModel = Export-AdReconciliationModel -OrgTreeCache $orgTreeCache -MemberRefs $refs -OrgTopDnKey $orgTopDnKey -PrivilegedNamePredicate $pred -JoinKeyAttribute $joinKeyAttr -JsonPath $reconJson -CsvPath $reconCsv -SnapshotAsOfUtc $snapshotAsOf -ExtractedAtUtc $snapNow -Scope $reconScope -ConfigHash $configHash -ContentHash $contentHash
+        $cc = $reconModel.generated.collectionCounts
+        Write-Host ("  Recon JSON : {0}" -f $reconJson) -ForegroundColor Gray
+        Write-Host ("  Recon CSV  : {0}" -f $reconCsv) -ForegroundColor Gray
+        Write-Host ("  Recon model: identities={0} managerEdges={1} accessGrants={2}" -f $cc.identities, $cc.managerEdges, $cc.accessGrants) -ForegroundColor Gray
+    } catch { Write-Host "  [warn] -ReconExport failed: $_" -ForegroundColor Yellow }
+}
+
 # ---- Gate (-FailOn) ----
 $fails = @()
 if ($FailOn -contains 'StaleCache' -and $staleTripped) { $fails += "StaleCache ($staleWarn)" }
@@ -285,6 +347,19 @@ if ($FailOn -contains 'PrivConcentration' -and $S.TotalPrivRefs -gt 0) {
     $topPct = 0
     foreach ($rk in @($agg.Roots)) { if ($agg.Nodes.ContainsKey($rk)) { $p = [int][math]::Round(100.0 * $agg.Nodes[$rk].SubtreePrivRefs / $S.TotalPrivRefs); if ($p -gt $topPct) { $topPct = $p } } }
     if ($topPct -ge $PrivConcentrationPct) { $fails += "PrivConcentration (one branch holds $topPct% of privileged refs >= $PrivConcentrationPct%)" }
+}
+# ---- P3a recon gates (only when the reconciliation model was built) ----
+if ($FailOn -contains 'SingleRootBroken' -and $reconModel) {
+    # Architecture sec.2: exactly one sanctioned org root. >1 root (orphan-sub-roots) or a missing top = broken.
+    $rootCount = @($reconModel.identities | Where-Object { $_.chain.state -eq 'OrgTop' }).Count
+    $orphanCount = @($reconModel.identities | Where-Object { $_.chain.state -eq 'OrphanSubRoot' }).Count
+    if ($rootCount -ne 1 -or $orphanCount -gt 0) {
+        $fails += "SingleRootBroken (declared org-top roots=$rootCount, orphan-sub-roots=$orphanCount; expected exactly 1 root and 0 orphans)"
+    }
+}
+if ($FailOn -contains 'PrivilegedUnroutable' -and $reconModel) {
+    $pu = [int]$reconModel.summary.headline.privilegedUnreviewable
+    if ($pu -gt 0) { $fails += "PrivilegedUnroutable ($pu privileged account(s) cannot route an access review)" }
 }
 
 if ($fails.Count -gt 0) {
