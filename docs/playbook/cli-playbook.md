@@ -5,8 +5,9 @@
 > and every parameter. Each parameter notes its **GUI equivalent**; for GUI workflows
 > see `gui-playbook.md`.
 
-There are four entry scripts. `Invoke-GroupEnumerator.ps1` is the workhorse; the others
-are focused utilities.
+`Invoke-GroupEnumerator.ps1` is the workhorse; the rest are focused single-purpose
+utilities — cross-reference, attribute lookup, state validation, privileged-risk, membership
+churn, the Org Role Map (+ AD↔ISC↔HR reconciliation), and the ISC change diff.
 
 ---
 
@@ -170,10 +171,12 @@ member records carry `ManagerDN`). The org tree is derived from those edges.
 - **Adhoc** — `-Mode Adhoc -CachePath <snapshot.json>`: render from a snapshot only; **no state
   writes** (auditor "what did this snapshot look like" mode).
 **Synopsis.**
-`.\Invoke-OrgRoleMap.ps1 -Mode Full|Delta|Adhoc [-CachePath <json>] [-OrgTreePath <json>] [-Groups <name…>] [-PrivilegedOnly] [-Days <n>|-Since <date>|-Period …] [-Backend Auto|Sqlite|Json] [-DbPath <db>] [-StatePath <dir>] [-DepthCap <n>] [-BuildOrgTree] [-MaxStaleDays <n>] [-FailOn StaleCache,UnmanagedBucket,PrivConcentration] [-AllPrivileged] [-PrivilegedPattern <regex…>] [-ReplacePrivilegedBuiltins] [-DefaultOpenDepth <n>] [-ExportCsv <path>] [-OutputHtml <path>] [-Quiet]`.
+`.\Invoke-OrgRoleMap.ps1 -Mode Full|Delta|Adhoc [-CachePath <json>] [-OrgTreePath <json>] [-Groups <name…>] [-PrivilegedOnly] [-Days <n>|-Since <date>|-Period …] [-Backend Auto|Sqlite|Json] [-DbPath <db>] [-StatePath <dir>] [-DepthCap <n>] [-BuildOrgTree] [-MaxStaleDays <n>] [-FailOn StaleCache,UnmanagedBucket,PrivConcentration,SingleRootBroken,PrivilegedUnroutable] [-AllPrivileged] [-PrivilegedPattern <regex…>] [-ReplacePrivilegedBuiltins] [-DefaultOpenDepth <n>] [-ReconExport <path>] [-OrgTop <sam>] [-JoinKeyAttribute <attr>] [-ExportCsv <path>] [-OutputHtml <path>] [-Quiet]`.
 **Exit codes:** `0` ok/informational, `1` error, `2` a `-FailOn` threshold tripped (stale org-tree
 cache; an oversized **Unmanaged** bucket — service accounts / accounts with no manager, itself a
-finding; or one branch holding too high a share of privileged refs).
+finding; one branch holding too high a share of privileged refs; **SingleRootBroken** — the org tree
+isn't a single rooted hierarchy / has orphaned sub-roots; or **PrivilegedUnroutable** — privileged
+accounts whose management chain can't be reviewed up to the declared org-top).
 **Leadership-facing report.** Plain-English (no jargon), counts-only/no-names; a top summary leads
 with **distinct people** (people with tracked/privileged access, managers vs individuals) so totals
 aren't misread as headcount. `-DefaultOpenDepth <n>` sets how many levels the chart starts expanded;
@@ -188,6 +191,38 @@ stop at an unreachable trust boundary (documented, not a bug).
 > custom patterns; `-ReplacePrivilegedBuiltins` uses **only** those patterns. The **same three flags**
 > work on `Invoke-MembershipChurn.ps1` and `Invoke-PrivilegedRiskCheck.ps1`. Defaults come from config
 > (`AllGroupsPrivileged`, `PrivilegedPatterns`, `ReplacePrivilegedBuiltins`).
+
+> **AD↔ISC↔HR reconciliation (additive export).** `-ReconExport <path>` writes a reconciliation
+> model — a versioned **JSON** plus a **CSV twin** — alongside the report: per-identity join-key
+> coverage, manager-chain health (a 7-state classifier), and confirmed AD-only findings
+> (`MGR_DISABLED_IN_CHAIN`, `CHAIN_BROKEN`, `JOINKEY_MISSING`, `AD_NOT_IN_HR`, …). `-OrgTop <sam>`
+> declares the apex of the org (falls back to config `OrgTopSam`) so chains that reach it read
+> **Healthy** rather than orphaned; `-JoinKeyAttribute <attr>` sets the correlation attribute
+> (default `employeeID`, from config `JoinKeyAttribute`). The two reconciliation gates extend
+> `-FailOn`: **SingleRootBroken** and **PrivilegedUnroutable** (above). CLI-only — not surfaced in
+> the GUI.
+
+---
+
+## Script: `Invoke-IscChangeDiff.ps1`
+**Purpose.** Turn an existing **ISC change feed** — `groups-isc-changes-both*.csv`, the
+SailPoint-ready `Change,Domain,GroupName,SamAccountName,DisplayName,Email` export where `Change` is
+`Added`/`Removed` — into a clean, two-section **adds/removes** report. Output is one self-contained,
+light, **paste-friendly** HTML (survives copy into Outlook/Word) in the SailPoint delta style: KPI
+cards (added · removed · groups affected · net), an **ADDED** section as a per-**user** list (one row
+per user with the groups they joined), and a **REMOVED** removal **table** (one row per group/user
+removal). Privileged groups carry a `PRIV` badge via the RC08 classifier.
+**When.** After a tracked run has produced a change feed and you want a readable diff to circulate —
+cleaner than the full attestation log for a quick "what changed" summary.
+**Reads only the feed** — never touches AD, the cache, or the state ledger. **CLI-only** (no GUI tab).
+**Synopsis.**
+`.\Invoke-IscChangeDiff.ps1 [-CsvPath <file|wildcard|dir>] [-OutputHtml <path>] [-ExportCsv <path>] [-Title <text>] [-AllPrivileged] [-PrivilegedPattern <regex…>] [-ReplacePrivilegedBuiltins] [-Quiet]`.
+**Feed resolution.** `-CsvPath` accepts a literal file, a wildcard, or a directory (newest
+`groups-isc-changes-both*.csv` inside). Omit it to auto-pick the newest such feed under `Output\`,
+then `State\`, then the tool root.
+**Output & location.** Default `Output\isc-change-diff-<timestamp>.html`; `-ExportCsv` also re-writes
+the normalized feed rows. The same configurable privileged flags as the other reports apply (PRIV
+badges). **Exit codes:** `0` report generated, `1` error (feed missing / unreadable).
 
 ---
 
@@ -244,6 +279,13 @@ when `-MigratingTo`/`-TargetSearchBase` (+ `-FuzzyMatch`/`-AnalyzeGaps`) are set
 # 5. Migration readiness (source vs target forest)
 .\Invoke-GroupEnumerator.ps1 -CsvPath .\groups.csv -AllowInsecure `
     -FuzzyMatch -AnalyzeGaps -MigratingTo 'TARGET.forest' -TargetSearchBase 'DC=target,DC=forest'
+
+# 6. Org Role Map with the AD↔ISC↔HR reconciliation export (JSON + CSV twin)
+.\Invoke-OrgRoleMap.ps1 -Mode Adhoc -CachePath .\Cache\groups-20260601-181204.json `
+    -OrgTop ceo -ReconExport .\Output\recon.json -OutputHtml .\Output\orgmap.html
+
+# 7. Clean adds/removes report from the newest ISC change feed (auto-discovered)
+.\Invoke-IscChangeDiff.ps1 -OutputHtml .\Output\changes.html
 ```
 
 ## Troubleshooting
@@ -256,3 +298,4 @@ when `-MigratingTo`/`-TargetSearchBase` (+ `-FuzzyMatch`/`-AnalyzeGaps`) are set
 | Group shows 0 / “at least N” members | skipped large group (≥ `LargeGroupThreshold`) — count may be truncated; lower the threshold or raise `MaxMemberCount` to expand. |
 | Incremental reused nothing / re-enumerates all | first run is always a full baseline; nested groups always re-enumerate. |
 | SQLite backend errors | Python 3 not on PATH; or use `-StateBackend json`. |
+| ISC change diff: “No change feed found” | no `groups-isc-changes-both*.csv` under `Output\`/`State\`/root — pass `-CsvPath`, or produce a feed first (a `-TrackChanges` run / change-feed export). |
