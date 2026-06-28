@@ -7,7 +7,8 @@
 
 `Invoke-GroupEnumerator.ps1` is the workhorse; the rest are focused single-purpose
 utilities — cross-reference, attribute lookup, state validation, privileged-risk, membership
-churn, the Org Role Map (+ AD↔ISC↔HR reconciliation), and the ISC change diff.
+churn, the Org Role Map (+ AD↔ISC↔HR reconciliation), the ISC change diff, and the membership
+backfill/replay.
 
 ---
 
@@ -226,6 +227,31 @@ badges). **Exit codes:** `0` report generated, `1` error (feed missing / unreada
 
 ---
 
+## Script: `Invoke-MembershipBackfill.ps1`
+**Purpose.** Retroactively reconstruct a **tracked history** from the per-run cache snapshots you
+already keep — for operators who ran WITHOUT `-TrackChanges`. It discovers `Cache\*.json` snapshots,
+orders them chronologically, and **replays** them through the *existing* change-tracking engine
+(reused unmodified) to synthesize the same `State\group-enumerator-state.json` + `changelog.jsonl`
+you would have had if tracking ran each day. Each event is stamped with **that snapshot's historical
+date** (`Metadata.GeneratedTimestamp` / `BuiltUtc`, falling back to the filename timestamp), NOT the
+current time; the **oldest snapshot is a silent baseline** (no events), matching real first-run
+semantics.
+**When.** A one-off catch-up after the fact, so the windowed reports (membership churn, Org Role Map
+Delta) and the ISC change diff have real history to work from.
+**Reads only; never touches the live `State\`.** A guard **refuses** to write into a destination that
+already holds a state/changelog file — point `-OutputDir` (or `-StatePath`) at an isolated directory;
+`-Force` allows a clean idempotent rebuild. The change-tracking core is reused, never modified.
+**Synopsis.**
+`.\Invoke-MembershipBackfill.ps1 -CachePath <folder|glob> -OutputDir <dir> [-StatePath <file>] [-EmitChangeFeed] [-ChangeFeedDir <dir>] [-Force] [-Quiet]`.
+**`-EmitChangeFeed`.** Additionally writes one SailPoint change-feed CSV per non-baseline day
+(`groups-isc-changes-both-<yyyyMMdd>.csv`, stamped historically) so `Invoke-IscChangeDiff.ps1` can
+render the adds/removes report over the reconstructed history.
+**Output & location.** Writes `group-enumerator-state.json` + `changelog.jsonl` (+ optional per-day
+feeds) to `-OutputDir`. **Exit codes:** `0` completed, `1` error (no cache, no destination, live-dir
+refusal, or core failure). DC-free; reads caches only.
+
+---
+
 ## Reports catalog (what each report is · when to use)
 
 **Baseline governance (B01–B10)** — `-BaselineReports` or `-BaselineReport <keys>`:
@@ -286,6 +312,9 @@ when `-MigratingTo`/`-TargetSearchBase` (+ `-FuzzyMatch`/`-AnalyzeGaps`) are set
 
 # 7. Clean adds/removes report from the newest ISC change feed (auto-discovered)
 .\Invoke-IscChangeDiff.ps1 -OutputHtml .\Output\changes.html
+
+# 8. Retroactively reconstruct tracked history from the per-day caches (isolated output + per-day feeds)
+.\Invoke-MembershipBackfill.ps1 -CachePath .\Cache -OutputDir .\_backfill-state -EmitChangeFeed
 ```
 
 ## Troubleshooting
