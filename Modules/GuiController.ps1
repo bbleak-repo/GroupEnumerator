@@ -2162,6 +2162,9 @@ function Initialize-GroupEnumeratorGui {
     if (Get-Command Initialize-ChangeTrackingTab -ErrorAction SilentlyContinue) {
         Initialize-ChangeTrackingTab
     }
+    if (Get-Command Initialize-ReconciliationTab -ErrorAction SilentlyContinue) {
+        Initialize-ReconciliationTab
+    }
 
     # ---- Keyboard Shortcuts ----
     # F5 = Run, Escape = Cancel (when running), Ctrl+S = Save Config, Ctrl+O = Open Output
@@ -4168,6 +4171,17 @@ function Update-OrgRoleMapReport {
         if ($plist.Count -gt 0) { $a += '-PrivilegedPattern'; $a += $plist }
     }
 
+    # --- AD reconciliation export (additive; ONLY when ChkOrmReconExport is ticked) ---
+    $reCtl = Find-GuiControl 'ChkOrmReconExport'
+    if ($null -ne $reCtl -and $reCtl.IsChecked -eq $true) {
+        $reconPath = Join-Path $outDir ("org-role-map-recon-{0}-{1}.json" -f $mode.ToLower(), (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        $a += @('-ReconExport', $reconPath)
+        $otCtl = Find-GuiControl 'TxtOrmOrgTop'
+        if ($null -ne $otCtl -and -not [string]::IsNullOrWhiteSpace($otCtl.Text)) { $a += @('-OrgTop', $otCtl.Text.Trim()) }
+        $jkCtl = Find-GuiControl 'TxtOrmJoinKey'
+        if ($null -ne $jkCtl -and -not [string]::IsNullOrWhiteSpace($jkCtl.Text)) { $a += @('-JoinKeyAttribute', $jkCtl.Text.Trim()) }
+    }
+
     $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ormScript @a 2>&1 | Out-String
     $code = $LASTEXITCODE
     $txt.Text = $out.Trim()
@@ -4180,6 +4194,82 @@ function Update-OrgRoleMapReport {
     if ($code -eq 2) { Set-StatusMessage -Message $msg -IsWarning }
     elseif ($code -eq 0) { Set-StatusMessage -Message $msg }
     else { Set-StatusMessage -Message $msg -IsError }
+}
+
+function Update-IscChangeDiff {
+    # Deliverable B1: ISC Change Diff. Read-only; ONLY shells to Invoke-IscChangeDiff.ps1.
+    # Renders the run output/exit code into TxtIscResult and opens the HTML report.
+    $txt = Find-GuiControl 'TxtIscResult'
+    if ($null -eq $txt) { return }
+    $iscScript = Join-Path $script:ScriptRoot 'Invoke-IscChangeDiff.ps1'
+    if (-not (Test-Path $iscScript)) { $txt.Text = 'Invoke-IscChangeDiff.ps1 not found.'; return }
+
+    # Resolve output dir exactly as Update-OrgRoleMapReport does.
+    $outDir = $null
+    $oCtl = Find-GuiControl 'TxtOutputDirectory'
+    if ($null -ne $oCtl -and -not [string]::IsNullOrWhiteSpace($oCtl.Text)) { $outDir = $oCtl.Text.Trim() }
+    if ([string]::IsNullOrWhiteSpace($outDir)) { $outDir = 'Output' }
+    if (-not [System.IO.Path]::IsPathRooted($outDir)) { $outDir = Join-Path $script:ScriptRoot $outDir }
+    if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+    $html = Join-Path $outDir ('isc-change-diff-{0}.html' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+
+    $a = @('-OutputHtml', $html)
+    # Feed CSV: pass -CsvPath ONLY when non-empty so the script's newest-file auto-pick is preserved.
+    $fCtl = Find-GuiControl 'TxtIscFeed'
+    if ($null -ne $fCtl -and -not [string]::IsNullOrWhiteSpace($fCtl.Text)) { $a += @('-CsvPath', $fCtl.Text.Trim()) }
+    $apCtl = Find-GuiControl 'ChkIscAllPriv'
+    if ($null -ne $apCtl -and $apCtl.IsChecked -eq $true) { $a += '-AllPrivileged' }
+
+    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $iscScript @a 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    $txt.Text = $out.Trim()
+    if (Test-Path $html) { try { Start-Process $html } catch { } }
+    if ($code -eq 0) { Set-StatusMessage -Message 'ISC change diff generated.' }
+    else { Set-StatusMessage -Message 'ISC change diff: could not run (see panel).' -IsError }
+}
+
+function Update-MembershipBackfill {
+    # Deliverable B2: Membership Backfill / replay. Read-only wrapper; ONLY shells to
+    # Invoke-MembershipBackfill.ps1. Defaults the output to an ISOLATED non-live dir
+    # (Output/backfill-state) so the CLI's live-State refusal guard is never tripped by
+    # accident, and NEVER auto-passes -Force.
+    $txt = Find-GuiControl 'TxtBfResult'
+    if ($null -eq $txt) { return }
+    $bfScript = Join-Path $script:ScriptRoot 'Invoke-MembershipBackfill.ps1'
+    if (-not (Test-Path $bfScript)) { $txt.Text = 'Invoke-MembershipBackfill.ps1 not found.'; return }
+
+    # Cache folder: explicit field, else default to the tool's Cache\ dir.
+    $cache = ''
+    $cCtl = Find-GuiControl 'TxtBfCache'
+    if ($null -ne $cCtl -and -not [string]::IsNullOrWhiteSpace($cCtl.Text)) { $cache = $cCtl.Text.Trim() }
+    if (-not $cache) { $cache = Join-Path $script:ScriptRoot 'Cache' }
+
+    # Output dir: explicit field, else the ISOLATED non-live default. Never the live State\ dir.
+    $outDir = ''
+    $oCtl = Find-GuiControl 'TxtBfOut'
+    if ($null -ne $oCtl -and -not [string]::IsNullOrWhiteSpace($oCtl.Text)) { $outDir = $oCtl.Text.Trim() }
+    if (-not $outDir) { $outDir = 'Output/backfill-state' }
+    if (-not [System.IO.Path]::IsPathRooted($outDir)) { $outDir = Join-Path $script:ScriptRoot $outDir }
+
+    $a = @('-CachePath', $cache, '-OutputDir', $outDir)
+    $efCtl = Find-GuiControl 'ChkBfEmitFeed'
+    if ($null -ne $efCtl -and $efCtl.IsChecked -eq $true) { $a += '-EmitChangeFeed' }
+    $fCtl = Find-GuiControl 'ChkBfForce'
+    if ($null -ne $fCtl -and $fCtl.IsChecked -eq $true) { $a += '-Force' }
+
+    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $bfScript @a 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    $txt.Text = $out.Trim()
+    if ($code -eq 0) { Set-StatusMessage -Message 'Membership backfill complete.' }
+    else { Set-StatusMessage -Message 'Membership backfill: could not run (see panel).' -IsError }
+}
+
+function Initialize-ReconciliationTab {
+    # Wires the Reconciliation tab. B1: ISC Change Diff button. B2: Membership Backfill button (T-04).
+    $btnIsc = Find-GuiControl 'BtnIscRun'
+    if ($null -ne $btnIsc) { $btnIsc.Add_Click({ Update-IscChangeDiff }.GetNewClosure()) }
+    $btnBf = Find-GuiControl 'BtnBfRun'
+    if ($null -ne $btnBf) { $btnBf.Add_Click({ Update-MembershipBackfill }.GetNewClosure()) }
 }
 
 function Initialize-ChangeTrackingTab {

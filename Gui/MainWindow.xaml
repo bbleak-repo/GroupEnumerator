@@ -1199,6 +1199,14 @@
                                 </StackPanel>
                                 <TextBox x:Name="TxtOrmCache" Style="{StaticResource FieldBox}" Margin="0,6,0,0"
                                          ToolTip="Optional: snapshot cache JSON (enumerated with -IncludeAttributes manager) for Full/Adhoc. Leave blank to use the newest file in Cache\."/>
+                                <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                    <CheckBox x:Name="ChkOrmReconExport" Content="Export reconciliation (JSON+CSV)" Style="{StaticResource FieldCheckBox}" VerticalAlignment="Center"
+                                              ToolTip="When ticked, additionally write the AD reconciliation model (versioned JSON + CSV twin) to the output dir via Invoke-OrgRoleMap -ReconExport. Off = today's Org Role Map behavior, unchanged."/>
+                                    <TextBlock Text="org top" VerticalAlignment="Center" Margin="14,0,4,0" Foreground="{DynamicResource BrushText}" FontSize="12"/>
+                                    <TextBox x:Name="TxtOrmOrgTop" Width="160" Style="{StaticResource FieldBox}" VerticalAlignment="Center" ToolTip="OrgTop sAMAccountName"/>
+                                    <TextBlock Text="join key" VerticalAlignment="Center" Margin="12,0,4,0" Foreground="{DynamicResource BrushText}" FontSize="12"/>
+                                    <TextBox x:Name="TxtOrmJoinKey" Width="140" Style="{StaticResource FieldBox}" VerticalAlignment="Center" ToolTip="JoinKeyAttribute, hint employeeID"/>
+                                </StackPanel>
                                 <TextBlock x:Name="TxtOrmResult" Text="" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11" Margin="0,8,0,0"/>
                             </StackPanel>
                         </Border>
@@ -1252,6 +1260,67 @@
                             </DataGrid.Columns>
                         </DataGrid>
                     </Border>
+                </Grid>
+            </TabItem>
+
+            <!-- ========================================================
+                 Tab: Reconciliation (ISC change diff + membership backfill)
+                 ======================================================== -->
+            <TabItem Header="Reconciliation" Style="{StaticResource ToolkitTabItem}">
+                <Grid Background="{DynamicResource BrushBackground}" Margin="12,8">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <StackPanel>
+                            <!-- B1: ISC Change Diff -->
+                            <TextBlock Text="ISC Change Diff" Style="{StaticResource SectionHeader}"/>
+                            <Border Style="{StaticResource SectionBorder}">
+                                <StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                        <TextBlock Text="feed CSV" VerticalAlignment="Center" Margin="0,0,4,0" Foreground="{DynamicResource BrushText}" FontSize="12"/>
+                                        <TextBox x:Name="TxtIscFeed" Width="360" Style="{StaticResource FieldBox}" VerticalAlignment="Center"
+                                                 ToolTip="Blank auto-picks the newest groups-isc-changes-both*.csv under Output\, then State\, then the tool root."/>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                        <CheckBox x:Name="ChkIscAllPriv" Content="Treat all groups as privileged" Style="{StaticResource FieldCheckBox}" VerticalAlignment="Center"
+                                                  ToolTip="Treat every group in the feed as privileged for the diff (overrides name-pattern detection)."/>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                        <Button x:Name="BtnIscRun" Content="ISC Change Diff" Style="{StaticResource SecondaryButton}"
+                                                HorizontalAlignment="Left" ToolTip="Run Invoke-IscChangeDiff.ps1 and open the HTML diff."/>
+                                    </StackPanel>
+                                    <TextBlock x:Name="TxtIscResult" Text="" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11" Margin="0,8,0,0"/>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- B2: Membership Backfill -->
+                            <TextBlock Text="Membership Backfill" Style="{StaticResource SectionHeader}" Margin="0,12,0,0"/>
+                            <Border Style="{StaticResource SectionBorder}">
+                                <StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                        <TextBlock Text="cache folder" VerticalAlignment="Center" Margin="0,0,4,0" Foreground="{DynamicResource BrushText}" FontSize="12"/>
+                                        <TextBox x:Name="TxtBfCache" Width="360" Text="Cache" Style="{StaticResource FieldBox}" VerticalAlignment="Center"
+                                                 ToolTip="Folder of enumeration snapshots to replay (default Cache)."/>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                        <TextBlock Text="output dir" VerticalAlignment="Center" Margin="0,0,4,0" Foreground="{DynamicResource BrushText}" FontSize="12"/>
+                                        <TextBox x:Name="TxtBfOut" Width="360" Text="Output/backfill-state" Style="{StaticResource FieldBox}" VerticalAlignment="Center"
+                                                 ToolTip="ISOLATED output dir (NEVER the live State\). Default Output\backfill-state keeps the tool's live-State refusal guard from tripping."/>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                        <CheckBox x:Name="ChkBfEmitFeed" Content="Emit per-day change feed" Style="{StaticResource FieldCheckBox}" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                        <CheckBox x:Name="ChkBfForce" Content="Force rebuild" Style="{StaticResource FieldCheckBox}" VerticalAlignment="Center"
+                                                  ToolTip="Rebuild even if state exists (passes -Force). Off by default."/>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                        <Button x:Name="BtnBfRun" Content="Membership Backfill" Style="{StaticResource SecondaryButton}"
+                                                HorizontalAlignment="Left" ToolTip="Run Invoke-MembershipBackfill.ps1 against the isolated output dir."/>
+                                    </StackPanel>
+                                    <TextBlock x:Name="TxtBfResult" Text="" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11" Margin="0,8,0,0"/>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </ScrollViewer>
                 </Grid>
             </TabItem>
 
